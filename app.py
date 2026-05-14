@@ -267,41 +267,48 @@ def plot_bar(labels, values, title, highlight_first=True, right_formatter=lambda
 def detect_layout(df):
     """Detect Industries/Buzzwords columns.
 
-    Single mode: a column whose stripped name ends with the word "Industries" or
-    "Buzzwords" (case-insensitive). Catches "Industries", "(Company) Industries",
-    "(Trading Address) Industries", trailing-space variants, etc.
+    Single mode: a column whose stripped name ends with the word "Industries",
+    "Industry", "Buzzwords", or "Buzzword" (case-insensitive). Catches all of:
+        Industries, (Company) Industries, (Trading Address) Industries,
+        Industry, (Company) Industry, Buzzwords, (Company) Buzzwords,
+        Buzzword, etc. — plus trailing-space variants.
 
-    Wide mode: any column whose name starts with "Industries - " or
-    "Buzzwords - " (or ": " variants).
+    Beauhurst uses the plural form on company exports and the singular form on
+    deal / acquisition exports, so both must be supported.
+
+    Wide mode: any column whose name starts with "Industries - " / "Industry - "
+    / "Buzzwords - " / "Buzzword - " (or ": " variants).
     """
     cols = list(df.columns.astype(str))
 
-    def _find_single(suffix_word):
-        suffix_lower = suffix_word.lower()
+    def _find_single(*suffix_words):
+        """Return the first column matching any of the suffix words."""
+        suffix_lowers = [w.lower() for w in suffix_words]
         # Exact / parenthesised matches first
         for c in cols:
             name = c.strip().lower()
-            if name == suffix_lower:
+            if name in suffix_lowers:
                 return c
-            if name.endswith(") " + suffix_lower):
-                return c
+            for s in suffix_lowers:
+                if name.endswith(") " + s):
+                    return c
         # Anything ending in the suffix word as the final token
         for c in cols:
             tokens = c.strip().split()
-            if tokens and tokens[-1].lower() == suffix_lower:
+            if tokens and tokens[-1].lower() in suffix_lowers:
                 return c
         return None
 
-    ind_s = _find_single("Industries")
-    buzz_s = _find_single("Buzzwords")
+    ind_s = _find_single("Industries", "Industry")
+    buzz_s = _find_single("Buzzwords", "Buzzword")
 
     # Wide-format indicator columns
-    def _is_wide(col, prefix):
+    def _is_wide(col, *prefixes):
         head = col.strip().split(" - ", 1)[0].split(": ", 1)[0].strip().lower()
-        return head == prefix.lower() and (" - " in col or ": " in col)
+        return head in [p.lower() for p in prefixes] and (" - " in col or ": " in col)
 
-    ind_w = [c for c in cols if _is_wide(c, "Industries")]
-    buzz_w = [c for c in cols if _is_wide(c, "Buzzwords")]
+    ind_w = [c for c in cols if _is_wide(c, "Industries", "Industry")]
+    buzz_w = [c for c in cols if _is_wide(c, "Buzzwords", "Buzzword")]
 
     # Prefer single-column layout if at least one of the two exists
     if ind_s or buzz_s:
@@ -448,16 +455,63 @@ if uploaded_file:
 
     # --- CALCULATION LOGIC ---
     if mode == "Yes":
-        layout = detect_layout(df_active)
-        if layout["mode"] == "unknown":
-            st.error("Could not find Industry or Buzzword columns. Expected a column named 'Industries' / 'Buzzwords' "
-                    "(or a '(...) Industries' variant), or wide-format columns like 'Industries - FinTech'.")
-            st.stop()
-        if layout["mode"] == "single":
-            found_bits = []
-            if layout.get("ind_col"): found_bits.append(f"`{layout['ind_col']}`")
-            if layout.get("buzz_col"): found_bits.append(f"`{layout['buzz_col']}`")
-            st.caption("Detected columns: " + ", ".join(found_bits))
+        layout_auto = detect_layout(df_active)
+
+        # Auto-detection provides the defaults; user can override either column
+        # to point at any column in their file. This makes Ranklin work even
+        # when Beauhurst (or the user's own export) names columns unexpectedly.
+        with st.sidebar:
+            cols_with_none = ["<None>"] + list(df_active.columns.astype(str))
+
+            if layout_auto["mode"] == "wide":
+                ind_w = layout_auto.get("ind_cols", [])
+                buzz_w = layout_auto.get("buzz_cols", [])
+                st.caption(
+                    f"Detected wide-format columns "
+                    f"({len(ind_w)} industry, {len(buzz_w)} buzzword)."
+                )
+                use_auto_wide = st.checkbox(
+                    "Use detected wide-format columns",
+                    value=True,
+                    help="Uncheck to instead pick a single Industry/Buzzword column manually."
+                )
+            else:
+                use_auto_wide = False
+
+            if not use_auto_wide:
+                auto_ind = layout_auto.get("ind_col") if layout_auto["mode"] == "single" else None
+                auto_buzz = layout_auto.get("buzz_col") if layout_auto["mode"] == "single" else None
+                ind_idx = cols_with_none.index(auto_ind) if auto_ind in cols_with_none else 0
+                buzz_idx = cols_with_none.index(auto_buzz) if auto_buzz in cols_with_none else 0
+
+                ind_col_choice = st.selectbox(
+                    "Industry column",
+                    cols_with_none,
+                    index=ind_idx,
+                    help="Pick any column with comma-separated industry tags. "
+                         "Auto-detected default shown — change if your column is named differently."
+                )
+                buzz_col_choice = st.selectbox(
+                    "Buzzword column",
+                    cols_with_none,
+                    index=buzz_idx,
+                    help="Pick any column with comma-separated buzzword tags, or <None> to skip."
+                )
+
+        if use_auto_wide:
+            layout = layout_auto
+        else:
+            ind_col_final = None if ind_col_choice == "<None>" else ind_col_choice
+            buzz_col_final = None if buzz_col_choice == "<None>" else buzz_col_choice
+            if not (ind_col_final or buzz_col_final):
+                st.error(
+                    "Pick at least one column to rank from. Use the Industry column or "
+                    "Buzzword column dropdowns in the sidebar — any column with "
+                    "comma-separated values will work."
+                )
+                st.stop()
+            layout = {"mode": "single", "ind_col": ind_col_final, "buzz_col": buzz_col_final}
+
         metric_series = process_industry_buzzword(
             df_active, layout, amount_choice if ranking_by != "Count" else None
         )
