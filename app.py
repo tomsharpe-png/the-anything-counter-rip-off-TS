@@ -147,7 +147,18 @@ def smart_split_industries(value, canonical_sorted=_MULTI_COMMA_SORTED):
 def load_data(file, sheet_name=None):
     ext = os.path.splitext(file.name)[1].lower()
     if ext in [".xlsx", ".xls"]:
-        return pd.read_excel(file, sheet_name=sheet_name, engine="openpyxl" if ext == ".xlsx" else "xlrd")
+        engine = "openpyxl" if ext == ".xlsx" else "xlrd"
+        if sheet_name is None:
+            # Defensive: pd.read_excel(..., sheet_name=None) returns a dict of all
+            # sheets, which would break every df.columns call downstream. Read the
+            # first non-empty sheet instead.
+            all_sheets = pd.read_excel(file, sheet_name=None, engine=engine)
+            for name, sheet_df in all_sheets.items():
+                if not sheet_df.empty:
+                    return sheet_df
+            # All sheets empty - return the first one anyway so we have a frame
+            return next(iter(all_sheets.values()))
+        return pd.read_excel(file, sheet_name=sheet_name, engine=engine)
     try:
         return pd.read_csv(file)
     except Exception:
@@ -318,8 +329,35 @@ def detect_layout(df):
     return {"mode": "unknown"}
 
 
-def find_amount_columns(cols):
-    return [c for c in cols if any(x in c.lower() for x in ["amount raised", "gbp", "converted to gbp"])]
+def rank_amount_columns(cols):
+    """Return all columns, with the most plausible 'amount' columns first.
+
+    Preference order:
+      1. GBP-converted columns
+      2. Other money-flavoured columns (amount raised, consideration, valuation,
+         turnover, revenue, etc.)
+      3. Everything else, preserving original order
+
+    Nothing is filtered out — the user can always pick any column they like.
+    """
+    cols = list(cols)
+    gbp = []
+    money = []
+    others = []
+    money_hints = (
+        "amount raised", "consideration", "valuation", "turnover", "revenue",
+        "income", "profit", "ebitda", "cash", "funding", "investment",
+        "price", "value", "cost", "salary", "spend", "fee", "£", "gbp", "usd", "eur",
+    )
+    for c in cols:
+        lc = str(c).lower()
+        if "gbp" in lc or "converted to gbp" in lc:
+            gbp.append(c)
+        elif any(h in lc for h in money_hints):
+            money.append(c)
+        else:
+            others.append(c)
+    return gbp + money + others
 
 
 def _cell_has_data(series):
@@ -416,11 +454,38 @@ if uploaded_file:
                     help="Treat multi-comma Beauhurst industry names (e.g. 'Repair, maintenance and servicing') as a single item."
                 )
             if analysis_type == "Sum":
-                sum_col = st.selectbox("Numeric Column to Sum", df.select_dtypes(include='number').columns)
+                # All columns are eligible — pandas may have read a number column
+                # as text because of a stray 'N/A'; we coerce to numeric below so
+                # the user is never silently locked out of a column they want.
+                sum_col = st.selectbox(
+                    "Column to Sum",
+                    df.columns,
+                    help="Any column with numeric values. Non-numeric values are ignored when summing."
+                )
+                if not pd.api.types.is_numeric_dtype(df[sum_col]):
+                    coerced = pd.to_numeric(df[sum_col], errors="coerce")
+                    valid = coerced.notna().sum()
+                    if valid == 0:
+                        st.warning(f"'{sum_col}' has no numeric values — sums will all be zero.")
+                    else:
+                        st.caption(f"'{sum_col}' isn't a number column; using {valid:,} numeric values from it.")
         else:
             ranking_by = st.radio("Rank by:", ["Count", "Total Amount Raised"], horizontal=True)
-            amt_choice_raw = st.selectbox("Amount column", ["<None>"] + find_amount_columns(df.columns))
+            # Show every column, with GBP/money-flavoured columns ranked first.
+            ranked_amount_cols = rank_amount_columns(df.columns)
+            amt_choice_raw = st.selectbox(
+                "Amount column",
+                ["<None>"] + ranked_amount_cols,
+                help="Any numeric column will work. Best matches (GBP-converted, then other money columns) are listed first."
+            )
             amount_choice = None if amt_choice_raw == "<None>" else amt_choice_raw
+            if amount_choice and not pd.api.types.is_numeric_dtype(df[amount_choice]):
+                coerced = pd.to_numeric(df[amount_choice], errors="coerce")
+                valid = coerced.notna().sum()
+                if valid == 0:
+                    st.warning(f"'{amount_choice}' has no numeric values — totals will all be zero.")
+                else:
+                    st.caption(f"'{amount_choice}' isn't a number column; using {valid:,} numeric values from it.")
 
         st.markdown("---")
         st.header("3. Raw Data Filters")
@@ -443,11 +508,27 @@ if uploaded_file:
         apply_trigger = st.button("🚀 APPLY CHANGES", use_container_width=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
+    # Track which (file, sheet) the cached df_active belongs to. When this
+    # changes - e.g. the user switches sheets in a multi-sheet workbook - we
+    # need to rebuild df_active or every column dropdown ends up showing the
+    # previous sheet's columns.
+    current_source = (getattr(uploaded_file, "name", None), sheet_name)
+    source_changed = st.session_state.get("data_source") != current_source
+    if source_changed:
+        # Drop any filter rules pointing at columns that don't exist on the
+        # new sheet, otherwise the next Apply click will crash.
+        current_cols = set(df.columns.astype(str))
+        st.session_state.rules = [
+            r for r in st.session_state.get("rules", [])
+            if r.get("col") in current_cols
+        ]
+        st.session_state.data_source = current_source
+
     # Filtering Execution
-    if apply_trigger or 'df_active' not in st.session_state:
+    if apply_trigger or source_changed or 'df_active' not in st.session_state:
         df_active = df.copy()
         for rule in st.session_state.rules:
-            if rule['vals']:
+            if rule['vals'] and rule['col'] in df_active.columns:
                 mask = df_active[rule['col']].astype(str).isin(rule['vals'])
                 df_active = df_active[mask] if rule['mode'] == "Include" else df_active[~mask]
         st.session_state.df_active = df_active
@@ -518,7 +599,10 @@ if uploaded_file:
         agg_label = ranking_by
     else:
         if analysis_type == "Sum":
-            metric_series = df_active.groupby(target_col)[sum_col].sum()
+            # Coerce so a text-typed number column (e.g. one containing stray 'N/A')
+            # still sums correctly. Non-numeric values become NaN and are skipped.
+            sum_values = pd.to_numeric(df_active[sum_col], errors="coerce")
+            metric_series = sum_values.groupby(df_active[target_col]).sum()
             agg_label = "Sum"
         else:
             if explode_enabled:
