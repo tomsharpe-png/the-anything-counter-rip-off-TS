@@ -40,65 +40,379 @@ h1 { color: #000000 !important; font-weight: 700 !important; }
 
 
 # ========================= BEAUHURST CANONICAL DATA =========================
-# Beauhurst industry names that contain commas inside the name itself. A naive
-# str.split(",") tears these apart (e.g. "Repair, maintenance and servicing"
-# becomes ["Repair", "maintenance and servicing"]) which double-counts them
-# and produces nonsense rankings. The smart splitter below treats every entry
-# in this list as an atomic unit that must be matched as a whole before any
-# remaining commas are used as separators.
+# Full list of canonical Beauhurst industries and buzzwords. The smart splitter
+# uses this as its primary reference: each row's tag column is scanned with a
+# longest-match-wins algorithm against this list before any naive comma split
+# is attempted. This means:
+#   - Names that contain commas internally ("Repair, maintenance and servicing")
+#     are kept atomic - no more being torn into fragments.
+#   - Whatever case the user's export uses, items are normalised back to the
+#     canonical Beauhurst form.
+#   - Unknown values still split on commas/semicolons - the splitter is tolerant,
+#     not destructive, so a new Beauhurst tag we don't know about yet still
+#     comes through.
 #
-# When Beauhurst adds new multi-comma industries, append them here. Source of
-# truth: the Industries & Buzzwords database in Notion. Buzzwords are not
-# included because they don't currently contain commas.
-MULTI_COMMA_INDUSTRIES = [
-    "Agriculture, land farming and forestry",
-    "Books, comics and graphic novels",
-    "Building materials, tools and accessories",
-    "Cars, motorcycles and other road vehicles",
-    "Dietary, and lifestyle, needs and choices",
-    "Event management, booking and ticketing",
-    "Festivals, conferences, exhibitions and fairs",
-    "Flowers, trees and other plants",
-    "Fruit, vegetables and fungi",
-    "Funerals and other posthumous products and services",
-    "Furniture, furnishings and fixtures",
-    "Gardening, landscaping and tree surgery",
-    "Healthcare products, toiletries and living aids",
-    "Heating, ventilation, air conditioning and mechanical and electrical systems",
-    "Languages, translation and interpretation",
-    "Marketing, branding and advertising",
-    "Mobile, internet and wireless hardware",
-    "Newspapers, magazines and online publishing",
-    "Painting, sculpture and other artworks",
-    "Physical product design, testing and quality assurance",
-    "Pop-up stores, street markets and food trucks",
-    "Ports, docks and marine infrastructure",
-    "Psychiatry, psychotherapy and counselling",
-    "Radio series, podcasts, audio books and other audio content",
-    "Repair, maintenance and servicing",
-    "Restaurants, pubs, cafes and takeaways",
-    "Rewards, loyalty schemes and vouchers",
-    "Scenery, sets, props and costumes",
-    "Sex, dating and relationships",
-    "Tours, excursions and experiences",
-    "Travel agencies, travel planning and organisation",
-    "Tutoring, training, coaching and skills development",
-    "Wealth, asset and investment management",
+# Source of truth: the Industries & Buzzwords database in Notion. Refresh by
+# re-running the extraction script when new tags appear.
+
+BEAUHURST_INDUSTRIES = [
+    'Accessories for tech devices',
+    'Accountancy and tax',
+    'Aggregates',
+    'Agriculture, land farming and forestry',
+    'Aircraft',
+    'Airports',
+    'Alcoholic beverages',
+    'Alternative medicine',
+    'Animal feed and pet food',
+    'Appliances and kitchenware',
+    'Application software',
+    'Architecture',
+    'Arts and crafts',
+    'Assistants',
+    'Auctioneering',
+    'Automotive dealerships',
+    'B&Bs and other short-term accommodation',
+    'Baked goods',
+    'Banking',
+    'Beauty and cosmetics',
+    'Betting and gambling',
+    'Bicycles and scooters',
+    'Biotechnology',
+    'Boats and ships',
+    'Books, comics and graphic novels',
+    'Budgeting and financial management',
+    'Building materials, tools and accessories',
+    'Butchers',
+    'Care homes',
+    'Cars, motorcycles and other road vehicles',
+    'Catering',
+    'Chemicals',
+    'Childcare and child supervision',
+    'Chips and processors',
+    'Cinemas',
+    'Civil engineering',
+    'Cleaning',
+    'Clinical diagnostics',
+    'Clinical research',
+    'Clothes',
+    'Collection and delivery',
+    'Condiments and seasonings',
+    'Confectionery and snacks',
+    'Corner shops',
+    'Courses and educational material',
+    'Credit ratings and scores',
+    'Currency exchange',
+    'Customer support',
+    'Dairy products',
+    'Data aggregation',
+    'Data centres',
+    'Data management',
+    'Data provision and analysis',
+    'Demolition and decommissioning',
+    'Dentistry and oral hygiene',
+    'Dietary, and lifestyle, needs and choices',
+    'Distribution and wholesale',
+    'Electricity generation',
+    'Electronics hardware',
+    'Embedded systems',
+    'Emergency services',
+    'Energy management and reduction',
+    'Energy storage',
+    'Energy utilities',
+    'Environmental consultancy',
+    'Estate agencies',
+    'Event management, booking and ticketing',
+    'Fabrics and textiles',
+    'Festivals, conferences, exhibitions and fairs',
+    'Films and TV',
+    'Fish',
+    'Fishing and aquafarming',
+    'Flowers, trees and other plants',
+    'Food and drink processing',
+    'Footwear',
+    'Freight and haulage',
+    'Fruit, vegetables and fungi',
+    'Funerals and other posthumous products and services',
+    'Furniture, furnishings and fixtures',
+    'Gardening, landscaping and tree surgery',
+    'Gemstones and precious metals',
+    'Gifts',
+    'Glass',
+    'Graphic design',
+    'Gyms and spas',
+    'Hazard and damage control',
+    'Health and safety',
+    'Healthcare products, toiletries and living aids',
+    'Heating, ventilation, air conditioning and mechanical and electrical systems',
+    'Heavy equipment and machinery',
+    'Higher education',
+    'Home and garden',
+    'Homecare (domiciliary care)',
+    'Hospitals and clinics',
+    'Hotels',
+    'Human resources',
+    'Insurance',
+    'Interior design',
+    'Investment banking and corporate finance',
+    'Jewellery and other accessories',
+    'Land',
+    'Languages, translation and interpretation',
+    'Lead generation and sales support',
+    'Legal services',
+    'Lighting',
+    'Livestock and equine',
+    'Loans',
+    'Management and strategy consultancy',
+    'Manufacturing',
+    'Market research',
+    'Marketing, branding and advertising',
+    'Materials technology',
+    'Mechanics and garages',
+    'Medical devices and instruments',
+    'Medical doctors',
+    'Meetups and social clubs',
+    'Mental well-being',
+    'Military and defence',
+    'Mining',
+    'Mobile and temporary accommodation',
+    'Mobile, internet and wireless hardware',
+    'Music',
+    'Music venues',
+    'Newspapers, magazines and online publishing',
+    'Nightclubs and bars',
+    'Non-alcoholic beverages',
+    'Non-precious metals',
+    'Nurseries',
+    'Office space',
+    'Oil and gas',
+    'Online marketplace',
+    'Online retailing',
+    'Ophthalmology and opticians',
+    'Packaging and printing',
+    'Painting, sculpture and other artworks',
+    'Parking',
+    'Parks',
+    'Parts and components',
+    'Passenger airlines',
+    'Pasta',
+    'Payment processing',
+    'Performance art',
+    'Personnel supply and contract outsourcing',
+    'Pets',
+    'Pharmaceuticals',
+    'Pharmacies',
+    'Photography and videography',
+    'Physical fitness coaching and training',
+    'Physical product design, testing and quality assurance',
+    'Physical retailing',
+    'Physical sciences research',
+    'Physiotherapy and massage',
+    'Plastics and rubber',
+    'Pop-up stores, street markets and food trucks',
+    'Ports, docks and marine infrastructure',
+    'Pregnancy and parenting',
+    'Private equity and venture capital',
+    'Private vehicle hire (taxis and minicabs)',
+    'Product rental and hire',
+    'Property and environmental survey',
+    'Property and land assets investment',
+    'Property and land assets management',
+    'Property development and construction',
+    'Provision of raw materials',
+    'Psychiatry, psychotherapy and counselling',
+    'Public relations',
+    'Radio series, podcasts, audio books and other audio content',
+    'Ready meals and meal kits',
+    'Recruitment',
+    'Renewable energy',
+    'Repair, maintenance and servicing',
+    'Research tools and reagents',
+    'Restaurants, pubs, cafes and takeaways',
+    'Retail consultancy',
+    'Rewards, loyalty schemes and vouchers',
+    'Risk and compliance',
+    'Roads and bridges',
+    'Robots and automation',
+    'Satellite hardware',
+    'Scenery, sets, props and costumes',
+    'Schools',
+    'Second-hand and antique items',
+    'Security and surveillance',
+    'Self-storage',
+    'Sensors',
+    'Server hardware',
+    'Server software',
+    'Sex, dating and relationships',
+    'Shipyards and shipbuilding',
+    'Signage and physical advertising',
+    'Smoking and vaping',
+    'Social media',
+    'Space infrastructure',
+    'Sporting events and activities',
+    'Sports clubs',
+    'Sports equipment and apparel',
+    'Sports venues',
+    'Student accommodation',
+    'Supermarkets and department stores',
+    'Supply chain management',
+    'Surgeries and non-surgical procedures',
+    'Technology consultancy and IT and telecommunications support',
+    'Telecommunication infrastructure',
+    'Telecommunication utilities',
+    'Tours, excursions and experiences',
+    'Toys and games',
+    'Tradespeople and trade services',
+    'Trading platforms',
+    'Trains and trams',
+    'Travel agencies, travel planning and organisation',
+    'Tutoring, training, coaching and skills development',
+    'Venue hire',
+    'Vets',
+    'Video content (including pre- and post-production)',
+    'Video games',
+    'Vitamins and other supplements',
+    'Warehouses (bonded and non-bonded)',
+    'Waste management and recycling',
+    'Wealth, asset and investment management',
+    'Website hosting',
+    'Weddings',
+    'boring and drilling',
+    'cards and stationery',
+    'debt and grants',
+    'fishmongers and greengrocers',
+    'galleries',
+    'headhunting and talent management',
+    'meat and eggs',
+    'news agents',
+    'off-licences and petrol stations',
+    'rice and other dry processed foods',
+    'secretaries and administrative support',
+    'steel and other alloys',
+    'theatres and museums',
+    'water and air management',
+    'zoos and farm attractions',
 ]
 
-# Pre-sort by length descending once (longest match wins on ambiguous prefixes).
-_MULTI_COMMA_SORTED = sorted(MULTI_COMMA_INDUSTRIES, key=len, reverse=True)
+BEAUHURST_BUZZWORDS = [
+    '3D printing',
+    'AdTech',
+    'Advanced manufacturing',
+    'AgeTech',
+    'AgriTech',
+    'Alternative finance',
+    'Artificial Intelligence',
+    'AssistiveTech',
+    'Augmented reality',
+    'Autonomous vehicles',
+    'Big data',
+    'Biomass and biofuels',
+    'Biometrics',
+    'Blockchain',
+    'Cannabis',
+    'Carbon capture',
+    'Chatbots',
+    'Clean energy',
+    'CleanTech',
+    'Cloud computing',
+    'CollabTech',
+    'ConTech',
+    'Creative industries',
+    'Crypto-currencies',
+    'Defence',
+    'Digital and technologies',
+    'Digital security',
+    'Drones',
+    'EdTech',
+    'Electric and hybrid vehicles',
+    'Esports',
+    'Ethical shopping',
+    'EventTech',
+    'FinTech',
+    'Financial services',
+    'FoodTech',
+    'Franchise',
+    'Gamification',
+    'Genomics',
+    'Geospatial technology',
+    'HRTech',
+    'Image and voice recognition',
+    'InsurTech',
+    'Internet of Things',
+    'LawTech',
+    'Life sciences',
+    'MarTech',
+    'Mobile apps',
+    'Nudging and behavioural science',
+    'Omni-channel retailing',
+    'Open source',
+    'Point-of-Sale (PoS)',
+    'Pop-ups',
+    'Precision agriculture',
+    'Precision medicine',
+    'Preventive care',
+    'Professional and business services',
+    'PropTech',
+    'Quantum',
+    'RegTech',
+    'Robotics',
+    'Services on demand',
+    'Sharing economy',
+    'Smart cities',
+    'Smart energy',
+    'Smart homes',
+    'Social shopping',
+    'Software-as-a-Service (SaaS)',
+    'Subscription',
+    'Vegan/vegetarian',
+    'Virtual reality',
+    'VoIP',
+    'Wearables',
+    'eHealth',
+]
+# Pre-sort by length descending once. Longest-match-wins ensures that ambiguous
+# prefixes (e.g. "Repair" vs "Repair, maintenance and servicing") resolve to the
+# fuller canonical name when the input genuinely contains it.
+_CANONICAL_TAGS = BEAUHURST_INDUSTRIES + BEAUHURST_BUZZWORDS
+_CANONICAL_SORTED = sorted(_CANONICAL_TAGS, key=len, reverse=True)
+
+# Keep a lower-cased set for fast "is this a canonical Beauhurst tag?" checks.
+_CANONICAL_LOWER = {t.lower() for t in _CANONICAL_TAGS}
+
+# Backwards-compatible alias - older code expects MULTI_COMMA_INDUSTRIES.
+MULTI_COMMA_INDUSTRIES = [t for t in BEAUHURST_INDUSTRIES if "," in t]
+_MULTI_COMMA_SORTED = _CANONICAL_SORTED  # kept for backwards compatibility
 
 
-def smart_split_industries(value, canonical_sorted=_MULTI_COMMA_SORTED):
+def smart_split_industries(value, canonical_sorted=_CANONICAL_SORTED):
     """
-    Split a comma-separated string of Beauhurst industries while keeping known
-    multi-comma industry names intact.
+    Split a separator-separated string of Beauhurst tags into a list, using the
+    full Beauhurst canonical industries + buzzwords list as the primary
+    reference rather than naive comma splitting.
 
-    Example:
-        "Repair, maintenance and servicing, Manufacturing, FinTech"
-        ->
-        ["Repair, maintenance and servicing", "Manufacturing", "FinTech"]
+    Algorithm:
+      1. If the value contains a semicolon, split on semicolons (commas inside
+         names are kept literal - this is the whole reason semicolon-separated
+         exports exist).
+      2. Otherwise, scan the string left-to-right looking for the LONGEST
+         canonical Beauhurst tag that matches at the current position. Match
+         is case-insensitive; canonical case is preserved in the output.
+      3. If no canonical match starts here, fall back to splitting on the next
+         comma. This keeps the splitter tolerant: a new Beauhurst tag we don't
+         know about yet still comes through, it just doesn't get case-normalised.
+
+    The canonical list includes ALL 236 industries and 74 buzzwords from the
+    Beauhurst Industries & Buzzwords database, not only multi-comma names. This
+    means correctness across the board: every known Beauhurst tag is matched
+    atomically, even ones we haven't seen cause problems before.
+
+    Examples:
+        "Repair, maintenance and servicing, Manufacturing"
+            -> ["Repair, maintenance and servicing", "Manufacturing"]
+        "repair, maintenance and servicing, MANUFACTURING"
+            -> ["Repair, maintenance and servicing", "Manufacturing"]
+        "Repair, maintenance and servicing; Manufacturing; FinTech"
+            -> ["Repair, maintenance and servicing", "Manufacturing", "FinTech"]
     """
     if value is None or (isinstance(value, float) and np.isnan(value)):
         return []
@@ -106,6 +420,24 @@ def smart_split_industries(value, canonical_sorted=_MULTI_COMMA_SORTED):
     if not s or s.lower() in ("nan", "none"):
         return []
 
+    # Semicolon-separated: unambiguous separator. Still normalise items to
+    # canonical Beauhurst case where we can.
+    if ";" in s:
+        out = []
+        for x in (p.strip() for p in s.split(";")):
+            if not x or x.lower() in ("nan", "none"):
+                continue
+            if x.lower() in _CANONICAL_LOWER:
+                # Match canonical form (preserves case the user expects)
+                for canon in canonical_sorted:
+                    if canon.lower() == x.lower():
+                        out.append(canon)
+                        break
+            else:
+                out.append(x)
+        return out
+
+    # Comma-separated: longest-match scan against canonical multi-comma names
     items = []
     pos = 0
     n = len(s)
@@ -183,7 +515,15 @@ def process_industry_buzzword(df_active, layout, amount_choice=None):
 
         ind_col = layout.get("ind_col")
         buzz_col = layout.get("buzz_col")
-        cols = [c for c in (ind_col, buzz_col) if c]
+        # Dedupe while preserving order. When the user points both dropdowns at
+        # the same column (e.g. their export has Industries + Buzzwords merged
+        # into one column called 'Tags'), this prevents double-counting.
+        seen = set()
+        cols = []
+        for c in (ind_col, buzz_col):
+            if c and c not in seen:
+                cols.append(c)
+                seen.add(c)
 
         if not cols:
             return pd.Series(dtype=float)
@@ -211,8 +551,14 @@ def process_industry_buzzword(df_active, layout, amount_choice=None):
             return combined.groupby("item")["amt"].sum() if len(combined) else pd.Series(dtype=float)
 
     else:
-        # Wide mode (indicator columns like "Industries - FinTech")
-        cols_to_process = layout.get("ind_cols", []) + layout.get("buzz_cols", [])
+        # Wide mode (indicator columns like "Industries - FinTech"). Dedupe in
+        # case the same column appears in both ind_cols and buzz_cols lists.
+        seen = set()
+        cols_to_process = []
+        for c in layout.get("ind_cols", []) + layout.get("buzz_cols", []):
+            if c not in seen:
+                cols_to_process.append(c)
+                seen.add(c)
         if not cols_to_process:
             return pd.Series(dtype=float)
         pieces = []
@@ -232,13 +578,22 @@ def process_industry_buzzword(df_active, layout, amount_choice=None):
 
 @st.cache_data
 def process_generic_explode(df_active, target_col, use_smart_split=False):
-    """Split and count comma-separated strings in a generic column."""
+    """Split and count separator-separated strings in a generic column.
+
+    Recognises both comma and semicolon separators. If the cell contains a
+    semicolon, the row is split on semicolons (commas are kept literal);
+    otherwise the row is split on commas.
+    """
     if use_smart_split:
         exploded = df_active[target_col].apply(smart_split_industries).explode()
         exploded = exploded.dropna()
         return exploded[exploded != ""].value_counts()
-    s = df_active[target_col].dropna().astype(str).str.split(",")
-    ex = s.explode().str.strip()
+    s = df_active[target_col].dropna().astype(str)
+    # Per-row: if it contains ';', split on ';'; else split on ','.
+    has_semi = s.str.contains(";")
+    semi_part = s[has_semi].str.split(";")
+    comma_part = s[~has_semi].str.split(",")
+    ex = pd.concat([semi_part, comma_part]).explode().str.strip()
     return ex[~ex.isin(["", "nan", "None"])].value_counts()
 
 
@@ -569,15 +924,29 @@ if uploaded_file:
                     "Industry column",
                     cols_with_none,
                     index=ind_idx,
-                    help="Pick any column with comma-separated industry tags. "
-                         "Auto-detected default shown — change if your column is named differently."
+                    help="Pick any column with separator-separated industry tags "
+                         "(commas or semicolons both work). Auto-detected default "
+                         "shown — change if your column is named differently. If your "
+                         "export has industries and buzzwords merged into a single "
+                         "column, set both dropdowns to that column (or just pick it "
+                         "here and set Buzzword to <None>)."
                 )
                 buzz_col_choice = st.selectbox(
                     "Buzzword column",
                     cols_with_none,
                     index=buzz_idx,
-                    help="Pick any column with comma-separated buzzword tags, or <None> to skip."
+                    help="Pick any column with separator-separated buzzword tags, "
+                         "or <None> to skip. Commas and semicolons both work."
                 )
+                if (
+                    ind_col_choice != "<None>"
+                    and buzz_col_choice != "<None>"
+                    and ind_col_choice == buzz_col_choice
+                ):
+                    st.caption(
+                        f"Treating `{ind_col_choice}` as a combined Industry + "
+                        f"Buzzword column (counted once)."
+                    )
 
         if use_auto_wide:
             layout = layout_auto
