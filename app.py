@@ -847,17 +847,73 @@ if uploaded_file:
         if 'rules' not in st.session_state:
             st.session_state.rules = []
         c1, c2 = st.columns(2)
-        if c1.button("➕ Add"):
+        if c1.button("➕ Add filter"):
+            # Default new filters to the first column so the values dropdown
+            # has something to populate from on the first render.
             st.session_state.rules.append({'col': df.columns[0], 'mode': 'Include', 'vals': []})
-        if c2.button("➖ Rem"):
+        if c2.button("➖ Remove last"):
             if st.session_state.rules:
                 st.session_state.rules.pop()
+
+        df_cols = list(df.columns.astype(str))
         for i, rule in enumerate(st.session_state.rules):
-            with st.expander(f"Filter {i+1}: {rule['col']}"):
-                rule['col'] = st.selectbox("Column", df.columns, key=f"f_col_{i}")
-                rule['mode'] = st.radio("Action", ["Include", "Exclude"], key=f"f_mode_{i}", horizontal=True)
-                opts = sorted(df[rule['col']].astype(str).unique().tolist())
-                rule['vals'] = st.multiselect("Select Values", opts, key=f"f_vals_{i}")
+            # Expand by default so the column & values dropdowns are visible
+            # without the user having to click into the expander first - this
+            # was the source of the "no dropdown" confusion.
+            label = f"Filter {i+1}: {rule.get('col', '(pick a column)')}"
+            with st.expander(label, expanded=True):
+                # Resolve the current column safely: if the stored column no
+                # longer exists on this sheet, fall back to the first column.
+                current_col = rule.get('col')
+                if current_col not in df_cols:
+                    current_col = df_cols[0]
+                col_idx = df_cols.index(current_col)
+
+                chosen_col = st.selectbox(
+                    "Column",
+                    df_cols,
+                    index=col_idx,
+                    key=f"f_col_{i}",
+                    help="Column to filter on."
+                )
+                rule['col'] = chosen_col
+
+                rule['mode'] = st.radio(
+                    "Action",
+                    ["Include", "Exclude"],
+                    index=0 if rule.get('mode', 'Include') == 'Include' else 1,
+                    key=f"f_mode_{i}",
+                    horizontal=True,
+                )
+
+                # Build options from the freshly-chosen column. Drop NaN values
+                # and sort for a tidy dropdown. If the column is huge (>5000
+                # unique values), say so rather than locking up the browser.
+                series = df[chosen_col].dropna()
+                if len(series) == 0:
+                    st.caption(f"`{chosen_col}` has no non-empty values.")
+                    rule['vals'] = []
+                else:
+                    unique_vals = series.astype(str).unique()
+                    if len(unique_vals) > 5000:
+                        st.caption(
+                            f"`{chosen_col}` has {len(unique_vals):,} unique values — "
+                            f"showing the 5,000 most common."
+                        )
+                        top = (series.astype(str).value_counts().head(5000).index.tolist())
+                        opts = sorted(top)
+                    else:
+                        opts = sorted(unique_vals.tolist())
+                    # Keep only previously-selected values that still exist
+                    # in the new option list (column may have changed).
+                    prev = [v for v in rule.get('vals', []) if v in opts]
+                    rule['vals'] = st.multiselect(
+                        "Values to include / exclude",
+                        opts,
+                        default=prev,
+                        key=f"f_vals_{i}",
+                        help=f"{len(opts):,} option{'s' if len(opts) != 1 else ''} available."
+                    )
 
         st.markdown('<div class="apply-btn">', unsafe_allow_html=True)
         apply_trigger = st.button("🚀 APPLY CHANGES", use_container_width=True)
