@@ -551,29 +551,47 @@ def process_industry_buzzword(df_active, layout, amount_choice=None):
             return combined.groupby("item")["amt"].sum() if len(combined) else pd.Series(dtype=float)
 
     else:
-        # Wide mode (indicator columns like "Industries - FinTech"). Dedupe in
-        # case the same column appears in both ind_cols and buzz_cols lists.
+        # Wide mode (indicator columns like "Industries - FinTech" or
+        # "Buzzwords - Creative industries"). Each column carries a TRUE/FALSE
+        # value per row; we count how many rows are TRUE for each tag, then
+        # rank the tags.
+        #
+        # Dedupe defensively in case the same column got listed in both
+        # ind_cols and buzz_cols (e.g. a column named "Industries - X" that
+        # also matched a Buzzword pattern).
         seen = set()
         cols_to_process = []
         for c in layout.get("ind_cols", []) + layout.get("buzz_cols", []):
-            if c not in seen:
+            if c not in seen and c in df_active.columns:
                 cols_to_process.append(c)
                 seen.add(c)
         if not cols_to_process:
             return pd.Series(dtype=float)
-        pieces = []
+
+        # Build a boolean matrix: rows x tags. Each cell is whether the row was
+        # tagged with that industry/buzzword, parsed robustly so TRUE/FALSE,
+        # 1/0, Yes/No etc. all work the same way.
+        tag_names = []
+        truthy_columns = {}
         for c in cols_to_process:
-            if c in df_active.columns:
-                name = c.split(" - ", 1)[-1]
-                pieces.append(df_active[c].rename(name))
-        if not pieces:
-            return pd.Series(dtype=float)
-        M = pd.concat(pieces, axis=1).groupby(level=0, axis=1).sum()
-        M = (M.fillna(0) != 0)
-        if amount_choice:
+            tag_name = c.split(" - ", 1)[-1].split(": ", 1)[-1].strip()
+            truthy_col = _to_truthy(df_active[c])
+            # If the tag appears in multiple source columns (deduped above by
+            # column name, not tag name), OR them together so a row counts
+            # once per tag, not once per source column.
+            if tag_name in truthy_columns:
+                truthy_columns[tag_name] = truthy_columns[tag_name] | truthy_col
+            else:
+                truthy_columns[tag_name] = truthy_col
+                tag_names.append(tag_name)
+
+        M = pd.DataFrame({name: truthy_columns[name] for name in tag_names})
+
+        if amount_choice and amount_choice in df_active.columns:
             amt = pd.to_numeric(df_active[amount_choice], errors="coerce").fillna(0)
+            # Each tag's total = sum of amounts for rows where that tag is True
             return M.multiply(amt, axis=0).sum()
-        return M.sum()
+        return M.sum().astype(int)
 
 
 @st.cache_data
@@ -668,19 +686,34 @@ def detect_layout(df):
     ind_s = _find_single("Industries", "Industry")
     buzz_s = _find_single("Buzzwords", "Buzzword")
 
-    # Wide-format indicator columns
+    # Wide-format indicator columns. The "head" is the bit before " - " or ": ";
+    # we match if its last word is one of the prefix words (case-insensitive),
+    # so all of these are recognised:
+    #   Industries - FinTech
+    #   Buzzwords - Creative industries
+    #   (Company) Industries - FinTech
+    #   (Trading Address) Buzzwords - Creative industries
     def _is_wide(col, *prefixes):
-        head = col.strip().split(" - ", 1)[0].split(": ", 1)[0].strip().lower()
-        return head in [p.lower() for p in prefixes] and (" - " in col or ": " in col)
+        if " - " not in col and ": " not in col:
+            return False
+        head = col.strip().split(" - ", 1)[0].split(": ", 1)[0].strip()
+        if not head:
+            return False
+        tokens = head.split()
+        last = tokens[-1].lower()
+        return last in [p.lower() for p in prefixes]
 
     ind_w = [c for c in cols if _is_wide(c, "Industries", "Industry")]
     buzz_w = [c for c in cols if _is_wide(c, "Buzzwords", "Buzzword")]
 
-    # Prefer single-column layout if at least one of the two exists
-    if ind_s or buzz_s:
-        return {"mode": "single", "ind_col": ind_s, "buzz_col": buzz_s}
+    # Prefer wide-format when present. Per-tag indicator columns are a
+    # deliberate Beauhurst export choice (usually the same export will also
+    # include a comma-separated 'Industries' summary, but the user picked the
+    # wide format because they want per-tag detail).
     if ind_w or buzz_w:
         return {"mode": "wide", "ind_cols": ind_w, "buzz_cols": buzz_w}
+    if ind_s or buzz_s:
+        return {"mode": "single", "ind_col": ind_s, "buzz_col": buzz_s}
     return {"mode": "unknown"}
 
 
@@ -720,6 +753,128 @@ def _cell_has_data(series):
     return series.notna() & (series.astype(str).str.strip() != "") & (series.astype(str).str.lower() != "nan")
 
 
+# Strings that count as TRUE / FALSE in wide-format indicator columns. Beauhurst
+# exports use any of these depending on tool/format - Excel may render TRUE/FALSE,
+# CSV may have "Yes"/"No", numerically-coded files may have 1/0, etc.
+_TRUTHY_STRINGS = {"true", "t", "yes", "y", "1", "1.0"}
+_FALSY_STRINGS = {"false", "f", "no", "n", "0", "0.0", "", "nan", "none", "null"}
+
+
+def _to_truthy(series):
+    """Return a boolean Series mapping the input to True/False values.
+
+    Handles all common ways Beauhurst exports indicator columns:
+      - Native booleans (True/False)
+      - Numeric (1/0, 1.0/0.0)
+      - Strings ("TRUE"/"FALSE", "true"/"false", "Yes"/"No", "1"/"0", etc.)
+      - NaN / empty / 'nan' / 'None' -> False
+
+    Anything not in the recognised falsy set is treated as truthy provided the
+    cell has content. This is the safe default - if a user has tagged a row
+    with a non-empty value, count it.
+    """
+    if pd.api.types.is_bool_dtype(series):
+        return series.fillna(False).astype(bool)
+    if pd.api.types.is_numeric_dtype(series):
+        # NaN -> False, 0 -> False, anything else -> True
+        return series.fillna(0).astype(bool)
+    # Object / mixed dtype: normalise to lowercase string, compare to known sets
+    s = series.fillna("").astype(str).str.strip().str.lower()
+    # Explicit falsy strings -> False; anything non-empty otherwise -> True
+    return ~s.isin(_FALSY_STRINGS)
+
+
+def is_year_column(name, series):
+    """Detect a 'year' column heuristically.
+
+    Beauhurst exports use bare integer years (e.g. 2024) in columns like
+    'Year of incorporation' or 'Deal year'. Pandas reads these as float because
+    of any NaNs, which is what produces the dreaded '2024.0' display. We
+    detect such columns by name pattern AND by checking the actual values look
+    like 4-digit years between 1800 and one year past the current year.
+    """
+    name_lc = str(name).lower()
+    name_hits_year = (
+        name_lc == "year"
+        or name_lc.endswith(" year")
+        or " year " in name_lc
+        or "year of" in name_lc
+        or name_lc.endswith(" year)")
+    )
+    if not name_hits_year:
+        return False
+    nums = pd.to_numeric(series, errors="coerce").dropna()
+    if nums.empty:
+        return False
+    # All non-null values must look like plausible years
+    next_year = datetime.now().year + 1
+    return ((nums >= 1800) & (nums <= next_year) & (nums == nums.astype(int))).all()
+
+
+def is_numeric_column(series):
+    """True if at least 80% of non-null values can be parsed as numbers.
+
+    Used to decide whether to offer numeric (range / <= / >= / between) filter
+    modes for a column. The 80% threshold lets us still treat a mostly-numeric
+    column as numeric even when there's the occasional stray text value.
+    """
+    non_null = series.dropna()
+    if len(non_null) == 0:
+        return False
+    if pd.api.types.is_numeric_dtype(series):
+        return True
+    coerced = pd.to_numeric(non_null, errors="coerce")
+    return coerced.notna().mean() >= 0.8
+
+
+def is_date_column(series):
+    """True if the column is a real datetime dtype (not a year-as-int)."""
+    return pd.api.types.is_datetime64_any_dtype(series)
+
+
+def display_value(v, is_year=False):
+    """Render a single value the way a person would expect to see it.
+
+    Strips the '.0' from float-encoded integers (e.g. years) and presents
+    Timestamps as ISO dates. Used both for dropdown options and as the
+    canonical key when matching filter selections against row values.
+    """
+    if v is None:
+        return ""
+    if isinstance(v, float):
+        if np.isnan(v):
+            return ""
+        if is_year or v.is_integer():
+            return str(int(v))
+        return str(v)
+    if isinstance(v, pd.Timestamp):
+        return v.strftime("%Y-%m-%d")
+    return str(v)
+
+
+def display_series(series, is_year=False):
+    """Apply display_value across a pandas Series, returning string dtype."""
+    is_year = bool(is_year)
+    if is_year:
+        nums = pd.to_numeric(series, errors="coerce")
+        out = nums.apply(lambda v: "" if pd.isna(v) else str(int(v)))
+        return out
+    return series.apply(lambda v: display_value(v))
+
+
+def safe_filename(s, default="chart"):
+    """Sanitise a user-supplied chart title into a safe download filename stem."""
+    if not s:
+        return default
+    s = str(s).strip()
+    # Strip path separators and characters problematic on Windows/Mac/Linux
+    bad = '<>:"/\\|?*\n\r\t'
+    out = "".join("_" if ch in bad else ch for ch in s)
+    out = out.strip(" ._")
+    return out or default
+
+
+
 def count_unknown_rows(df_active, mode, layout=None, target_col=None):
     """Number of rows in df_active that contributed nothing to the ranking.
 
@@ -738,10 +893,16 @@ def count_unknown_rows(df_active, mode, layout=None, target_col=None):
             return int((~has_any).sum())
         if layout.get("mode") == "wide":
             cols_to_check = layout.get("ind_cols", []) + layout.get("buzz_cols", [])
+            cols_to_check = [c for c in cols_to_check if c in df_active.columns]
             if not cols_to_check:
                 return 0
-            row_sum = df_active[cols_to_check].fillna(0).sum(axis=1)
-            return int((row_sum == 0).sum())
+            # A row is "unknown" if NONE of its indicator columns are truthy.
+            # Uses the same robust truthiness as the ranking logic, so TRUE/FALSE
+            # strings work as well as numeric 1/0.
+            any_true = pd.Series(False, index=df_active.index)
+            for c in cols_to_check:
+                any_true = any_true | _to_truthy(df_active[c])
+            return int((~any_true).sum())
         return 0
     if target_col is not None and target_col in df_active.columns:
         return int((~_cell_has_data(df_active[target_col])).sum())
@@ -848,22 +1009,18 @@ if uploaded_file:
             st.session_state.rules = []
         c1, c2 = st.columns(2)
         if c1.button("➕ Add filter"):
-            # Default new filters to the first column so the values dropdown
-            # has something to populate from on the first render.
-            st.session_state.rules.append({'col': df.columns[0], 'mode': 'Include', 'vals': []})
+            st.session_state.rules.append({
+                'col': df.columns[0], 'mode': 'Include', 'kind': 'Values',
+                'vals': [], 'op': '≥', 'num1': None, 'num2': None,
+            })
         if c2.button("➖ Remove last"):
             if st.session_state.rules:
                 st.session_state.rules.pop()
 
         df_cols = list(df.columns.astype(str))
         for i, rule in enumerate(st.session_state.rules):
-            # Expand by default so the column & values dropdowns are visible
-            # without the user having to click into the expander first - this
-            # was the source of the "no dropdown" confusion.
             label = f"Filter {i+1}: {rule.get('col', '(pick a column)')}"
             with st.expander(label, expanded=True):
-                # Resolve the current column safely: if the stored column no
-                # longer exists on this sheet, fall back to the first column.
                 current_col = rule.get('col')
                 if current_col not in df_cols:
                     current_col = df_cols[0]
@@ -878,6 +1035,34 @@ if uploaded_file:
                 )
                 rule['col'] = chosen_col
 
+                series = df[chosen_col]
+                is_year = is_year_column(chosen_col, series)
+                is_num = is_numeric_column(series) and not is_year_column(chosen_col, series)
+                # Years are treated as discrete values, not numeric ranges,
+                # because that's the natural way people want to pick them.
+                # If you'd prefer year ranges, that's a one-line tweak.
+
+                # Filter "kind" - either pick specific values or apply a numeric rule
+                kinds = ["Values"]
+                if is_num:
+                    kinds.append("Number rule")
+                if is_year:
+                    kinds = ["Values"]  # discrete year values
+
+                if rule.get('kind', 'Values') not in kinds:
+                    rule['kind'] = kinds[0]
+                if len(kinds) > 1:
+                    rule['kind'] = st.radio(
+                        "Filter type",
+                        kinds,
+                        index=kinds.index(rule['kind']),
+                        key=f"f_kind_{i}",
+                        horizontal=True,
+                        help="Pick specific values, or apply a numeric rule (=, ≥, ≤, between)."
+                    )
+                else:
+                    rule['kind'] = kinds[0]
+
                 rule['mode'] = st.radio(
                     "Action",
                     ["Include", "Exclude"],
@@ -886,34 +1071,72 @@ if uploaded_file:
                     horizontal=True,
                 )
 
-                # Build options from the freshly-chosen column. Drop NaN values
-                # and sort for a tidy dropdown. If the column is huge (>5000
-                # unique values), say so rather than locking up the browser.
-                series = df[chosen_col].dropna()
-                if len(series) == 0:
-                    st.caption(f"`{chosen_col}` has no non-empty values.")
-                    rule['vals'] = []
-                else:
-                    unique_vals = series.astype(str).unique()
-                    if len(unique_vals) > 5000:
-                        st.caption(
-                            f"`{chosen_col}` has {len(unique_vals):,} unique values — "
-                            f"showing the 5,000 most common."
-                        )
-                        top = (series.astype(str).value_counts().head(5000).index.tolist())
-                        opts = sorted(top)
-                    else:
-                        opts = sorted(unique_vals.tolist())
-                    # Keep only previously-selected values that still exist
-                    # in the new option list (column may have changed).
-                    prev = [v for v in rule.get('vals', []) if v in opts]
-                    rule['vals'] = st.multiselect(
-                        "Values to include / exclude",
-                        opts,
-                        default=prev,
-                        key=f"f_vals_{i}",
-                        help=f"{len(opts):,} option{'s' if len(opts) != 1 else ''} available."
+                if rule['kind'] == "Number rule":
+                    ops = ["=", "≥", "≤", ">", "<", "between"]
+                    rule['op'] = st.selectbox(
+                        "Comparison",
+                        ops,
+                        index=ops.index(rule.get('op')) if rule.get('op') in ops else 1,
+                        key=f"f_op_{i}",
                     )
+                    coerced = pd.to_numeric(series, errors="coerce").dropna()
+                    col_min = float(coerced.min()) if len(coerced) else 0.0
+                    col_max = float(coerced.max()) if len(coerced) else 0.0
+                    st.caption(
+                        f"`{chosen_col}` ranges from "
+                        f"{display_value(col_min)} to {display_value(col_max)} "
+                        f"({len(coerced):,} numeric values)."
+                    )
+                    if rule['op'] == "between":
+                        lo_default = rule.get('num1') if rule.get('num1') is not None else col_min
+                        hi_default = rule.get('num2') if rule.get('num2') is not None else col_max
+                        c_lo, c_hi = st.columns(2)
+                        rule['num1'] = c_lo.number_input(
+                            "From", value=float(lo_default), key=f"f_num1_{i}"
+                        )
+                        rule['num2'] = c_hi.number_input(
+                            "To", value=float(hi_default), key=f"f_num2_{i}"
+                        )
+                    else:
+                        default = rule.get('num1') if rule.get('num1') is not None else col_min
+                        rule['num1'] = st.number_input(
+                            "Value", value=float(default), key=f"f_num1_{i}"
+                        )
+                        rule['num2'] = None
+                else:
+                    # Values mode: build options from the column with year-aware
+                    # display so 2024 doesn't show as 2024.0
+                    non_null = series.dropna()
+                    if len(non_null) == 0:
+                        st.caption(f"`{chosen_col}` has no non-empty values.")
+                        rule['vals'] = []
+                    else:
+                        disp = display_series(non_null, is_year=is_year)
+                        unique_vals = disp[disp != ""].unique().tolist()
+                        if len(unique_vals) > 5000:
+                            st.caption(
+                                f"`{chosen_col}` has {len(unique_vals):,} unique values — "
+                                f"showing the 5,000 most common."
+                            )
+                            top = disp[disp != ""].value_counts().head(5000).index.tolist()
+                            opts = sorted(top)
+                        else:
+                            # Sort numerically when the column is year-like or numeric-looking
+                            try:
+                                opts = sorted(unique_vals, key=lambda v: (0, float(v)))
+                            except (ValueError, TypeError):
+                                opts = sorted(unique_vals)
+                        prev = [v for v in rule.get('vals', []) if v in opts]
+                        rule['vals'] = st.multiselect(
+                            "Values to include / exclude",
+                            opts,
+                            default=prev,
+                            key=f"f_vals_{i}",
+                            help=f"{len(opts):,} option{'s' if len(opts) != 1 else ''} available."
+                        )
+                    rule['op'] = None
+                    rule['num1'] = None
+                    rule['num2'] = None
 
         st.markdown('<div class="apply-btn">', unsafe_allow_html=True)
         apply_trigger = st.button("🚀 APPLY CHANGES", use_container_width=True)
@@ -939,9 +1162,50 @@ if uploaded_file:
     if apply_trigger or source_changed or 'df_active' not in st.session_state:
         df_active = df.copy()
         for rule in st.session_state.rules:
-            if rule['vals'] and rule['col'] in df_active.columns:
-                mask = df_active[rule['col']].astype(str).isin(rule['vals'])
-                df_active = df_active[mask] if rule['mode'] == "Include" else df_active[~mask]
+            col = rule.get('col')
+            if col not in df_active.columns:
+                continue
+            kind = rule.get('kind', 'Values')
+            mask = None
+
+            if kind == "Number rule":
+                op = rule.get('op')
+                n1 = rule.get('num1')
+                n2 = rule.get('num2')
+                if op is None or n1 is None:
+                    continue
+                col_numeric = pd.to_numeric(df_active[col], errors="coerce")
+                if op == "=":
+                    mask = col_numeric == n1
+                elif op == "≥":
+                    mask = col_numeric >= n1
+                elif op == "≤":
+                    mask = col_numeric <= n1
+                elif op == ">":
+                    mask = col_numeric > n1
+                elif op == "<":
+                    mask = col_numeric < n1
+                elif op == "between":
+                    if n2 is None:
+                        continue
+                    lo, hi = (n1, n2) if n1 <= n2 else (n2, n1)
+                    mask = (col_numeric >= lo) & (col_numeric <= hi)
+                # Rows where the value couldn't be coerced to a number must not
+                # pass an Include rule (NaN comparisons return False, so that
+                # naturally falls out - but make it explicit for safety).
+                if mask is not None:
+                    mask = mask.fillna(False)
+            else:
+                # Values mode: match on the year-aware displayed string so a user
+                # selecting "2024" matches both the float 2024.0 and the string "2024".
+                if not rule.get('vals'):
+                    continue
+                is_year = is_year_column(col, df_active[col])
+                disp = display_series(df_active[col], is_year=is_year)
+                mask = disp.isin(rule['vals'])
+
+            if mask is not None:
+                df_active = df_active[mask] if rule.get('mode', 'Include') == "Include" else df_active[~mask]
         st.session_state.df_active = df_active
     df_active = st.session_state.df_active
 
@@ -1086,12 +1350,28 @@ if uploaded_file:
             csv_df = build_csv_table(metric_series, unknown_count, item_label, value_label)
             csv_bytes = csv_df.to_csv(index=False).encode("utf-8")
 
+            # Custom filename, defaulting to the chart title. The default updates
+            # automatically whenever the chart title changes, unless the user
+            # has typed their own filename - we track that via session state.
+            default_stem = safe_filename(chart_title)
+            if st.session_state.get("_filename_last_default") != default_stem:
+                st.session_state["_filename_stem"] = default_stem
+                st.session_state["_filename_last_default"] = default_stem
+            filename_stem = st.text_input(
+                "Filename (no extension)",
+                value=st.session_state.get("_filename_stem", default_stem),
+                key="filename_stem_input",
+                help="Used for all three downloads below. Defaults to the chart title."
+            )
+            filename_stem = safe_filename(filename_stem, default=default_stem)
+            st.session_state["_filename_stem"] = filename_stem
+
             col_a, col_b, col_c = st.columns(3)
             svg_b = io.BytesIO(); fig.savefig(svg_b, format="svg", bbox_inches="tight", transparent=True)
-            col_a.download_button("SVG (Adobe)", svg_b.getvalue(), "chart.svg", "image/svg+xml")
+            col_a.download_button("SVG (Adobe)", svg_b.getvalue(), f"{filename_stem}.svg", "image/svg+xml")
             png_b = io.BytesIO(); fig.savefig(png_b, format="png", bbox_inches="tight", dpi=300)
-            col_b.download_button("PNG (High Res)", png_b.getvalue(), "chart.png", "image/png")
-            col_c.download_button("CSV (Data)", csv_bytes, "data_table.csv", "text/csv")
+            col_b.download_button("PNG (High Res)", png_b.getvalue(), f"{filename_stem}.png", "image/png")
+            col_c.download_button("CSV (Data)", csv_bytes, f"{filename_stem}.csv", "text/csv")
 
             if unknown_count > 0:
                 st.caption(f"CSV includes an 'Unknown' row for {unknown_count:,} row{'s' if unknown_count != 1 else ''} with no value in this column.")
