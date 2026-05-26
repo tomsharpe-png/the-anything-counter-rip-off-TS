@@ -475,6 +475,18 @@ def smart_split_industries(value, canonical_sorted=_CANONICAL_SORTED):
 
 
 # ========================= CACHED ENGINES =========================
+def _clean_columns(df):
+    """Strip leading/trailing whitespace from column names.
+
+    Excel and CSV exports often have headers with trailing spaces that are
+    invisible in the UI ('Combined LA ' vs 'Combined LA') but produce confusing
+    KeyErrors later when something matches by exact string equality. Normalising
+    once on load keeps every downstream comparison straightforward.
+    """
+    df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
+    return df
+
+
 @st.cache_data
 def load_data(file, sheet_name=None):
     ext = os.path.splitext(file.name)[1].lower()
@@ -487,14 +499,14 @@ def load_data(file, sheet_name=None):
             all_sheets = pd.read_excel(file, sheet_name=None, engine=engine)
             for name, sheet_df in all_sheets.items():
                 if not sheet_df.empty:
-                    return sheet_df
+                    return _clean_columns(sheet_df)
             # All sheets empty - return the first one anyway so we have a frame
-            return next(iter(all_sheets.values()))
-        return pd.read_excel(file, sheet_name=sheet_name, engine=engine)
+            return _clean_columns(next(iter(all_sheets.values())))
+        return _clean_columns(pd.read_excel(file, sheet_name=sheet_name, engine=engine))
     try:
-        return pd.read_csv(file)
+        return _clean_columns(pd.read_csv(file))
     except Exception:
-        return pd.read_csv(file, encoding="latin-1")
+        return _clean_columns(pd.read_csv(file, encoding="latin-1"))
 
 
 def _explode_smart(df_in, col):
@@ -1282,11 +1294,53 @@ if uploaded_file:
                 st.stop()
             layout = {"mode": "single", "ind_col": ind_col_final, "buzz_col": buzz_col_final}
 
+        # Defensive: validate every column the calculation will reference exists
+        # on df_active. Prevents KeyError stack traces after sheet switches /
+        # re-uploads where Streamlit retains a stale widget value.
+        required = []
+        if layout.get("mode") == "single":
+            for c in (layout.get("ind_col"), layout.get("buzz_col")):
+                if c:
+                    required.append(c)
+        elif layout.get("mode") == "wide":
+            required.extend(layout.get("ind_cols", []))
+            required.extend(layout.get("buzz_cols", []))
+        if ranking_by != "Count" and amount_choice:
+            required.append(amount_choice)
+        missing = [c for c in required if c not in df_active.columns]
+        if missing:
+            st.error(
+                "Column not found in current data: "
+                + ", ".join(repr(c) for c in missing)
+                + ". This usually means a previous selection is stale after "
+                "switching sheets or re-uploading. Re-select the column from "
+                "the dropdown in the sidebar, then click 🚀 APPLY CHANGES."
+            )
+            st.stop()
+
         metric_series = process_industry_buzzword(
             df_active, layout, amount_choice if ranking_by != "Count" else None
         )
         agg_label = ranking_by
     else:
+        # Defensive: if Streamlit's widget state retains a stale column name
+        # (a known foot-gun after switching sheets or re-uploading files), the
+        # raw access below would throw a KeyError stack trace. Surface a clean
+        # message instead and stop here.
+        required = [target_col]
+        if analysis_type == "Sum":
+            required.append(sum_col)
+        missing = [c for c in required if c and c not in df_active.columns]
+        if missing:
+            st.error(
+                "Column not found in current data: "
+                + ", ".join(repr(c) for c in missing)
+                + ". This usually means a previous selection is stale after "
+                "switching sheets or re-uploading. Re-select the column from "
+                "the dropdown in the sidebar, then click 🚀 APPLY CHANGES."
+            )
+            st.stop()
+
         if analysis_type == "Sum":
             # Coerce so a text-typed number column (e.g. one containing stray 'N/A')
             # still sums correctly. Non-numeric values become NaN and are skipped.
