@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import matplotlib as mpl
 import io, os
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, date
 
 # ========================= CONFIGURATION =========================
 # Ensuring fonts stay as editable text for Adobe Illustrator
@@ -863,12 +863,84 @@ def is_date_column(series):
     return pd.api.types.is_datetime64_any_dtype(series)
 
 
+def _parse_to_iso_date(v):
+    """Convert one value to a YYYY-MM-DD string, or None if it can't be parsed.
+
+    Works for any year from 0001 to 9999, including dates pandas can't represent
+    as Timestamps (pre-1677, post-2262). Tries the fast pandas path first; falls
+    back to dateutil.parser for out-of-range or unusual formats.
+
+    Years are zero-padded so ISO strings compare lexicographically the same way
+    they compare chronologically: "0570-06-15" < "1066-12-25" < "2024-01-01".
+    """
+    if v is None:
+        return None
+    if isinstance(v, float) and pd.isna(v):
+        return None
+    # Pandas Timestamp / numpy datetime64 - already in range, fast path
+    if isinstance(v, pd.Timestamp):
+        if pd.isna(v):
+            return None
+        return f"{int(v.year):04d}-{int(v.month):02d}-{int(v.day):02d}"
+    # Python date / datetime
+    if hasattr(v, "year") and hasattr(v, "month") and hasattr(v, "day"):
+        try:
+            return f"{int(v.year):04d}-{int(v.month):02d}-{int(v.day):02d}"
+        except Exception:
+            pass
+    s = str(v).strip()
+    if not s or s.lower() in ("nan", "none", "nat", "null"):
+        return None
+    # Fast path: pandas (handles ~95% of normal dates very quickly)
+    ts = pd.to_datetime(s, errors="coerce")
+    if pd.notna(ts):
+        return f"{int(ts.year):04d}-{int(ts.month):02d}-{int(ts.day):02d}"
+    # Fallback: dateutil for out-of-range years (570 AD etc.) or unusual formats
+    try:
+        from dateutil import parser as _dp
+        parsed = _dp.parse(s, dayfirst=False)
+        return f"{parsed.year:04d}-{parsed.month:02d}-{parsed.day:02d}"
+    except Exception:
+        pass
+    try:
+        from dateutil import parser as _dp
+        parsed = _dp.parse(s, dayfirst=True)
+        return f"{parsed.year:04d}-{parsed.month:02d}-{parsed.day:02d}"
+    except Exception:
+        return None
+
+
+def _iso_to_date(s):
+    """Convert a YYYY-MM-DD string to a Python date object (any year 1..9999)."""
+    if s is None:
+        return None
+    if isinstance(s, date):
+        return s
+    parts = str(s).split("-")
+    try:
+        return date(int(parts[0]), int(parts[1]), int(parts[2]))
+    except (ValueError, IndexError):
+        return None
+
+
+def to_iso_date_series(series):
+    """Convert a Series of date-ish values to a Series of YYYY-MM-DD strings.
+
+    Used in place of pd.to_datetime when the column may contain dates outside
+    the 1677-2262 Timestamp range. ISO strings sort chronologically when
+    compared lexicographically, so all the >, <, ≥, ≤, between comparisons
+    work directly on the string Series.
+    """
+    return series.apply(_parse_to_iso_date)
+
+
 def is_date_like(series):
     """True if values are dates or look parseable as dates (>= 80% success).
 
     Handles both real datetime dtypes and string date formats (YYYY/MM/DD,
-    DD/MM/YYYY, ISO, etc.). Years-as-integers are NOT counted as dates because
-    they're better handled as integer ranges, not date pickers.
+    DD/MM/YYYY, ISO, etc.) - including years pandas can't natively represent
+    as Timestamps (pre-1677). Years-as-integers are NOT counted as dates
+    because they're better handled as integer ranges, not date pickers.
     """
     if pd.api.types.is_datetime64_any_dtype(series):
         return True
@@ -876,31 +948,41 @@ def is_date_like(series):
     if len(non_null) == 0:
         return False
     # Pure-numeric columns aren't dates even if they coerce successfully
-    # (e.g. ints between 1970 and 2026 would parse as Unix timestamps - we
-    # don't want that).
     if pd.api.types.is_numeric_dtype(series):
         return False
-    # Sample to keep it cheap on large columns
     sample = non_null.head(200)
-    try:
-        parsed = pd.to_datetime(sample, errors="coerce", dayfirst=False)
-    except Exception:
-        return False
-    if parsed.notna().mean() < 0.8:
-        # Try day-first too (DD/MM/YYYY is common in UK exports)
+    # First try pandas (fast). If too many fail (likely out-of-range years),
+    # fall back to the full ISO parser which uses dateutil.
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
         try:
-            parsed = pd.to_datetime(sample, errors="coerce", dayfirst=True)
+            parsed = pd.to_datetime(sample, errors="coerce", dayfirst=False)
+            rate = parsed.notna().mean()
         except Exception:
-            return False
-    return parsed.notna().mean() >= 0.8
+            rate = 0.0
+        if rate < 0.8:
+            try:
+                parsed = pd.to_datetime(sample, errors="coerce", dayfirst=True)
+                rate = parsed.notna().mean()
+            except Exception:
+                pass
+    if rate < 0.8:
+        # Last resort: per-value parse via dateutil (handles year 570 etc.)
+        iso = to_iso_date_series(sample)
+        rate = iso.notna().mean()
+    return rate >= 0.8
 
 
 def to_dates(series):
-    """Coerce a series to datetime. Tries day-first if month-first fails."""
+    """Coerce a series to datetime (Timestamps).
+
+    Only works inside pandas' nanosecond range (1677-2262). For columns with
+    dates outside that range, use to_iso_date_series instead.
+    """
     primary = pd.to_datetime(series, errors="coerce")
     if pd.api.types.is_datetime64_any_dtype(series):
         return primary
-    # If month-first gave us a lot of NaT, try day-first
     if primary.notna().mean() < 0.8:
         non_null = series.dropna()
         if len(non_null) > 0:
@@ -1216,45 +1298,67 @@ if uploaded_file:
                     )
 
                     if rule['_type'] == 'date':
-                        # Date column: use date pickers
-                        dates = to_dates(series).dropna()
-                        if not len(dates):
+                        # Use ISO string conversion so dates outside pandas'
+                        # nanosecond range (pre-1677, post-2262) still work.
+                        iso_series = to_iso_date_series(series).dropna()
+                        if not len(iso_series):
                             st.caption(f"`{chosen_col}` has no parseable dates.")
                             rule['num1'] = None
                             rule['num2'] = None
                         else:
-                            col_min = dates.min().date()
-                            col_max = dates.max().date()
+                            # ISO strings sort lexicographically the same way
+                            # dates sort chronologically (year zero-padded).
+                            col_min_iso = iso_series.min()
+                            col_max_iso = iso_series.max()
+                            col_min = _iso_to_date(col_min_iso)
+                            col_max = _iso_to_date(col_max_iso)
                             st.caption(
-                                f"`{chosen_col}` ranges from {col_min.isoformat()} to "
-                                f"{col_max.isoformat()} ({len(dates):,} dated values)."
+                                f"`{chosen_col}` ranges from {col_min_iso} to "
+                                f"{col_max_iso} ({len(iso_series):,} dated values)."
                             )
-                            # Default to full range for between, otherwise the min
+
                             def _coerce_date(v, fallback):
                                 if v is None:
                                     return fallback
-                                if isinstance(v, str):
-                                    try:
-                                        return pd.to_datetime(v).date()
-                                    except Exception:
-                                        return fallback
-                                if hasattr(v, "date"):
+                                if isinstance(v, date) and not isinstance(v, datetime):
+                                    return v
+                                if isinstance(v, datetime):
                                     return v.date()
-                                return v
+                                if hasattr(v, "date") and callable(v.date):
+                                    try:
+                                        return v.date()
+                                    except Exception:
+                                        pass
+                                iso = _parse_to_iso_date(v)
+                                parsed = _iso_to_date(iso) if iso else None
+                                return parsed if parsed else fallback
+
+                            # Open up the picker bounds all the way to Python's
+                            # date limits so dates back to year 1 AD and forward
+                            # to 9999 AD are selectable. Required because some
+                            # historical datasets go back to year 570 or earlier.
+                            DATE_PICKER_MIN = date(1, 1, 1)
+                            DATE_PICKER_MAX = date(9999, 12, 31)
                             if rule['op'] == "between":
                                 lo_default = _coerce_date(rule.get('num1'), col_min)
                                 hi_default = _coerce_date(rule.get('num2'), col_max)
                                 c_lo, c_hi = st.columns(2)
                                 rule['num1'] = c_lo.date_input(
-                                    "From", value=lo_default, key=f"f_num1_{i}"
+                                    "From", value=lo_default,
+                                    min_value=DATE_PICKER_MIN, max_value=DATE_PICKER_MAX,
+                                    key=f"f_num1_{i}"
                                 ).isoformat()
                                 rule['num2'] = c_hi.date_input(
-                                    "To", value=hi_default, key=f"f_num2_{i}"
+                                    "To", value=hi_default,
+                                    min_value=DATE_PICKER_MIN, max_value=DATE_PICKER_MAX,
+                                    key=f"f_num2_{i}"
                                 ).isoformat()
                             else:
                                 default = _coerce_date(rule.get('num1'), col_min)
                                 rule['num1'] = st.date_input(
-                                    "Value", value=default, key=f"f_num1_{i}"
+                                    "Value", value=default,
+                                    min_value=DATE_PICKER_MIN, max_value=DATE_PICKER_MAX,
+                                    key=f"f_num1_{i}"
                                 ).isoformat()
                                 rule['num2'] = None
                     elif rule['_type'] == 'year':
@@ -1383,13 +1487,24 @@ if uploaded_file:
 
                 rtype = rule.get('_type', 'number')
                 if rtype == 'date':
-                    col_vals = to_dates(df_active[col])
-                    # n1/n2 stored as ISO date strings - parse to Timestamps
-                    try:
-                        v1 = pd.to_datetime(n1)
-                        v2 = pd.to_datetime(n2) if n2 is not None else None
-                    except Exception:
+                    # Compare as zero-padded ISO date strings. This handles
+                    # dates outside pandas' nanosecond Timestamp range (pre-1677,
+                    # post-2262), including historical data back to year 1 AD.
+                    # ISO 8601 dates with zero-padded years sort lexicographically
+                    # the same way they sort chronologically.
+                    col_vals = to_iso_date_series(df_active[col])
+                    # n1/n2 are already ISO strings from the date_input.isoformat()
+                    # call, but normalise via _parse_to_iso_date in case they came
+                    # from older session state in a different form.
+                    v1 = _parse_to_iso_date(n1)
+                    v2 = _parse_to_iso_date(n2) if n2 is not None else None
+                    if v1 is None:
                         continue
+                    # Cells we couldn't parse become NaN in col_vals; pandas '<' '>'
+                    # comparisons against NaN return False, but we replace NaN
+                    # with an unmatchable sentinel string just to be explicit.
+                    # We use the empty string which sorts before any real date.
+                    col_vals = col_vals.fillna("")
                 else:
                     col_vals = pd.to_numeric(df_active[col], errors="coerce")
                     v1, v2 = n1, n2
@@ -1409,6 +1524,11 @@ if uploaded_file:
                         continue
                     lo, hi = (v1, v2) if v1 <= v2 else (v2, v1)
                     mask = (col_vals >= lo) & (col_vals <= hi)
+                # For date: cells we couldn't parse have empty-string col_vals,
+                # which would falsely match ≥ "" or = "". Re-mask them out.
+                if rtype == 'date' and mask is not None:
+                    parseable = col_vals != ""
+                    mask = mask & parseable
                 # NaN/NaT comparisons return False but be explicit for safety
                 if mask is not None:
                     mask = mask.fillna(False)
