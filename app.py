@@ -15,7 +15,7 @@ mpl.rcParams['font.sans-serif'] = ['Arial', 'Helvetica', 'DejaVu Sans', 'sans-se
 
 APP_TITLE_COLOR = '#000000'
 
-st.set_page_config(page_title="Ranklin", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Ranklin rip off", layout="wide", initial_sidebar_state="expanded")
 
 # Custom CSS
 st.markdown("""
