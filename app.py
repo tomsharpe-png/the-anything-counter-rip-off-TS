@@ -1145,7 +1145,7 @@ def build_combined_csv_table(metric_series, final_series, unknown_count, item_la
 
 
 # ========================= APP START =========================
-st.markdown(f'<h1 style="color:{APP_TITLE_COLOR};">Ranklin</h1>', unsafe_allow_html=True)
+st.markdown(f'<h1 style="color:{APP_TITLE_COLOR};">Ranklin rip off</h1>', unsafe_allow_html=True)
 
 with st.sidebar:
     st.header("1. Data Source")
