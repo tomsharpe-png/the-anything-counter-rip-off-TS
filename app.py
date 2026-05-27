@@ -1013,6 +1013,55 @@ def build_csv_table(series, unknown_count, item_label, value_label, include_rank
     return df
 
 
+def build_combined_csv_table(metric_series, final_series, unknown_count, item_label, value_label):
+    """Build a single CSV with two side-by-side rankings.
+
+    Columns:
+      Full Rank | Full Industry / Buzzword | Full Number of companies | (blank) |
+      Chart Rank | Chart Industry / Buzzword | Chart Number of companies
+
+    The left half is the full ranking (every item from the metric series, plus
+    an Unknown row). The right half is the chart-matched ranking: drops items
+    excluded via the 'Exclude from chart' multiselect but keeps every other
+    item - not truncated to the top N bars.
+
+    A blank spacer column sits between the two halves so it's instantly readable
+    in Excel. The two halves can be different lengths; shorter side is padded
+    with empty rows so they're aligned at row 1 (the top rank).
+    """
+    full_df = build_csv_table(metric_series, unknown_count, item_label, value_label)
+    chart_df = build_csv_table(final_series, unknown_count, item_label, value_label)
+
+    # Prefix columns so the two halves are unambiguous when scanned
+    full_df = full_df.rename(columns={
+        "Rank": "Rank (Full)",
+        item_label: f"{item_label} (Full)",
+        value_label: f"{value_label} (Full)",
+    })
+    chart_df = chart_df.rename(columns={
+        "Rank": "Rank (Chart)",
+        item_label: f"{item_label} (Chart)",
+        value_label: f"{value_label} (Chart)",
+    })
+
+    # Pad the shorter side with empty rows so the two halves stay row-aligned
+    max_len = max(len(full_df), len(chart_df))
+    if len(full_df) < max_len:
+        pad = pd.DataFrame({c: [pd.NA] * (max_len - len(full_df)) for c in full_df.columns})
+        full_df = pd.concat([full_df, pad], ignore_index=True)
+    if len(chart_df) < max_len:
+        pad = pd.DataFrame({c: [pd.NA] * (max_len - len(chart_df)) for c in chart_df.columns})
+        chart_df = pd.concat([chart_df, pad], ignore_index=True)
+
+    # Concatenate horizontally with a blank spacer column between
+    spacer = pd.DataFrame({"": [""] * max_len})
+    combined = pd.concat(
+        [full_df.reset_index(drop=True), spacer, chart_df.reset_index(drop=True)],
+        axis=1,
+    )
+    return combined
+
+
 # ========================= APP START =========================
 st.markdown(f'<h1 style="color:{APP_TITLE_COLOR};">Ranklin</h1>', unsafe_allow_html=True)
 
@@ -1578,8 +1627,15 @@ if uploaded_file:
                     value_label = "Number of companies"
                 unknown_count = count_unknown_rows(df_active, mode="No", target_col=target_col)
 
-            csv_df = build_csv_table(metric_series, unknown_count, item_label, value_label)
-            csv_bytes = csv_df.to_csv(index=False).encode("utf-8")
+            # Single CSV with two side-by-side rankings:
+            #  - Left half (Full):  every item, no chart exclusions
+            #  - Right half (Chart): drops items in 'Exclude from chart', but
+            #    still extends to every remaining item, not just the top N bars
+            combined_df = build_combined_csv_table(
+                metric_series, final_series, unknown_count, item_label, value_label
+            )
+            csv_bytes = combined_df.to_csv(index=False).encode("utf-8")
+            chart_exclusion_count = len(metric_series) - len(final_series)
 
             # Custom filename, defaulting to the chart title. The default updates
             # automatically whenever the chart title changes, unless the user
@@ -1592,7 +1648,7 @@ if uploaded_file:
                 "Filename (no extension)",
                 value=st.session_state.get("_filename_stem", default_stem),
                 key="filename_stem_input",
-                help="Used for all three downloads below. Defaults to the chart title."
+                help="Used for all downloads below. Defaults to the chart title."
             )
             filename_stem = safe_filename(filename_stem, default=default_stem)
             st.session_state["_filename_stem"] = filename_stem
@@ -1602,9 +1658,22 @@ if uploaded_file:
             col_a.download_button("SVG (Adobe)", svg_b.getvalue(), f"{filename_stem}.svg", "image/svg+xml")
             png_b = io.BytesIO(); fig.savefig(png_b, format="png", bbox_inches="tight", dpi=300)
             col_b.download_button("PNG (High Res)", png_b.getvalue(), f"{filename_stem}.png", "image/png")
-            col_c.download_button("CSV (Data)", csv_bytes, f"{filename_stem}.csv", "text/csv")
+            col_c.download_button(
+                "CSV (Data)",
+                csv_bytes,
+                f"{filename_stem}.csv",
+                "text/csv",
+                help="Side-by-side rankings: the left columns are the FULL ranking "
+                     "(no chart exclusions); the right columns match the CHART (drops "
+                     "anything in 'Exclude from chart', keeps every other item)."
+            )
 
             if unknown_count > 0:
                 st.caption(f"CSV includes an 'Unknown' row for {unknown_count:,} row{'s' if unknown_count != 1 else ''} with no value in this column.")
+            if chart_exclusion_count > 0:
+                st.caption(
+                    f"Chart half of CSV omits {chart_exclusion_count} item{'s' if chart_exclusion_count != 1 else ''} "
+                    f"from the 'Exclude from chart' list; Full half keeps them."
+                )
 else:
     st.info("Please upload a file to begin.")
