@@ -384,6 +384,25 @@ MULTI_COMMA_INDUSTRIES = [t for t in BEAUHURST_INDUSTRIES if "," in t]
 _MULTI_COMMA_SORTED = _CANONICAL_SORTED  # kept for backwards compatibility
 
 
+# The UK Industrial Strategy 8 - high-level Beauhurst buzzwords used as
+# umbrella categories. They aggregate many specific industries underneath
+# them, so when present in a ranking they typically dominate the top of the
+# chart, which can be more noise than signal. The UI exposes a toggle to
+# exclude them; canonical Beauhurst case is used here so the case-insensitive
+# filter matches whatever the export's casing looks like.
+IS_8_BUZZWORDS = [
+    "Advanced manufacturing",
+    "Clean energy",
+    "Creative industries",
+    "Defence",
+    "Digital and technologies",
+    "Financial services",
+    "Life sciences",
+    "Professional and business services",
+]
+_IS_8_LOWER = {t.lower() for t in IS_8_BUZZWORDS}
+
+
 def smart_split_industries(value, canonical_sorted=_CANONICAL_SORTED):
     """
     Split a separator-separated string of Beauhurst tags into a list, using the
@@ -844,6 +863,53 @@ def is_date_column(series):
     return pd.api.types.is_datetime64_any_dtype(series)
 
 
+def is_date_like(series):
+    """True if values are dates or look parseable as dates (>= 80% success).
+
+    Handles both real datetime dtypes and string date formats (YYYY/MM/DD,
+    DD/MM/YYYY, ISO, etc.). Years-as-integers are NOT counted as dates because
+    they're better handled as integer ranges, not date pickers.
+    """
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return True
+    non_null = series.dropna()
+    if len(non_null) == 0:
+        return False
+    # Pure-numeric columns aren't dates even if they coerce successfully
+    # (e.g. ints between 1970 and 2026 would parse as Unix timestamps - we
+    # don't want that).
+    if pd.api.types.is_numeric_dtype(series):
+        return False
+    # Sample to keep it cheap on large columns
+    sample = non_null.head(200)
+    try:
+        parsed = pd.to_datetime(sample, errors="coerce", dayfirst=False)
+    except Exception:
+        return False
+    if parsed.notna().mean() < 0.8:
+        # Try day-first too (DD/MM/YYYY is common in UK exports)
+        try:
+            parsed = pd.to_datetime(sample, errors="coerce", dayfirst=True)
+        except Exception:
+            return False
+    return parsed.notna().mean() >= 0.8
+
+
+def to_dates(series):
+    """Coerce a series to datetime. Tries day-first if month-first fails."""
+    primary = pd.to_datetime(series, errors="coerce")
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return primary
+    # If month-first gave us a lot of NaT, try day-first
+    if primary.notna().mean() < 0.8:
+        non_null = series.dropna()
+        if len(non_null) > 0:
+            sample_dayfirst = pd.to_datetime(non_null.head(200), errors="coerce", dayfirst=True)
+            if sample_dayfirst.notna().mean() > primary.dropna().notna().mean():
+                return pd.to_datetime(series, errors="coerce", dayfirst=True)
+    return primary
+
+
 def display_value(v, is_year=False):
     """Render a single value the way a person would expect to see it.
 
@@ -1023,7 +1089,7 @@ if uploaded_file:
         if c1.button("➕ Add filter"):
             st.session_state.rules.append({
                 'col': df.columns[0], 'mode': 'Include', 'kind': 'Values',
-                'vals': [], 'op': '≥', 'num1': None, 'num2': None,
+                'vals': [], 'op': '≥', 'num1': None, 'num2': None, '_type': 'number',
             })
         if c2.button("➖ Remove last"):
             if st.session_state.rules:
@@ -1049,17 +1115,15 @@ if uploaded_file:
 
                 series = df[chosen_col]
                 is_year = is_year_column(chosen_col, series)
-                is_num = is_numeric_column(series) and not is_year_column(chosen_col, series)
-                # Years are treated as discrete values, not numeric ranges,
-                # because that's the natural way people want to pick them.
-                # If you'd prefer year ranges, that's a one-line tweak.
+                is_date = is_date_like(series) and not is_year
+                is_num = is_numeric_column(series) and not is_year and not is_date
 
-                # Filter "kind" - either pick specific values or apply a numeric rule
+                # Filter "kind" - pick specific values or apply a range/comparison
+                # rule. Range/comparison works for numbers, years, and dates -
+                # the input widgets adapt to the column type.
                 kinds = ["Values"]
-                if is_num:
-                    kinds.append("Number rule")
-                if is_year:
-                    kinds = ["Values"]  # discrete year values
+                if is_num or is_year or is_date:
+                    kinds.append("Range / comparison")
 
                 if rule.get('kind', 'Values') not in kinds:
                     rule['kind'] = kinds[0]
@@ -1070,7 +1134,8 @@ if uploaded_file:
                         index=kinds.index(rule['kind']),
                         key=f"f_kind_{i}",
                         horizontal=True,
-                        help="Pick specific values, or apply a numeric rule (=, ≥, ≤, between)."
+                        help="Pick specific values, or apply a range (=, ≥, ≤, >, <, between). "
+                             "Ranges work for numbers, years, and dates."
                     )
                 else:
                     rule['kind'] = kinds[0]
@@ -1083,38 +1148,117 @@ if uploaded_file:
                     horizontal=True,
                 )
 
-                if rule['kind'] == "Number rule":
+                if rule['kind'] == "Range / comparison":
+                    # Record the column type on the rule so the eval code knows
+                    # how to coerce values consistently.
+                    if is_date:
+                        rule['_type'] = 'date'
+                    elif is_year:
+                        rule['_type'] = 'year'
+                    else:
+                        rule['_type'] = 'number'
+
                     ops = ["=", "≥", "≤", ">", "<", "between"]
                     rule['op'] = st.selectbox(
                         "Comparison",
                         ops,
-                        index=ops.index(rule.get('op')) if rule.get('op') in ops else 1,
+                        index=ops.index(rule.get('op')) if rule.get('op') in ops else (5 if rule['_type'] == 'date' else 1),
                         key=f"f_op_{i}",
                     )
-                    coerced = pd.to_numeric(series, errors="coerce").dropna()
-                    col_min = float(coerced.min()) if len(coerced) else 0.0
-                    col_max = float(coerced.max()) if len(coerced) else 0.0
-                    st.caption(
-                        f"`{chosen_col}` ranges from "
-                        f"{display_value(col_min)} to {display_value(col_max)} "
-                        f"({len(coerced):,} numeric values)."
-                    )
-                    if rule['op'] == "between":
-                        lo_default = rule.get('num1') if rule.get('num1') is not None else col_min
-                        hi_default = rule.get('num2') if rule.get('num2') is not None else col_max
-                        c_lo, c_hi = st.columns(2)
-                        rule['num1'] = c_lo.number_input(
-                            "From", value=float(lo_default), key=f"f_num1_{i}"
+
+                    if rule['_type'] == 'date':
+                        # Date column: use date pickers
+                        dates = to_dates(series).dropna()
+                        if not len(dates):
+                            st.caption(f"`{chosen_col}` has no parseable dates.")
+                            rule['num1'] = None
+                            rule['num2'] = None
+                        else:
+                            col_min = dates.min().date()
+                            col_max = dates.max().date()
+                            st.caption(
+                                f"`{chosen_col}` ranges from {col_min.isoformat()} to "
+                                f"{col_max.isoformat()} ({len(dates):,} dated values)."
+                            )
+                            # Default to full range for between, otherwise the min
+                            def _coerce_date(v, fallback):
+                                if v is None:
+                                    return fallback
+                                if isinstance(v, str):
+                                    try:
+                                        return pd.to_datetime(v).date()
+                                    except Exception:
+                                        return fallback
+                                if hasattr(v, "date"):
+                                    return v.date()
+                                return v
+                            if rule['op'] == "between":
+                                lo_default = _coerce_date(rule.get('num1'), col_min)
+                                hi_default = _coerce_date(rule.get('num2'), col_max)
+                                c_lo, c_hi = st.columns(2)
+                                rule['num1'] = c_lo.date_input(
+                                    "From", value=lo_default, key=f"f_num1_{i}"
+                                ).isoformat()
+                                rule['num2'] = c_hi.date_input(
+                                    "To", value=hi_default, key=f"f_num2_{i}"
+                                ).isoformat()
+                            else:
+                                default = _coerce_date(rule.get('num1'), col_min)
+                                rule['num1'] = st.date_input(
+                                    "Value", value=default, key=f"f_num1_{i}"
+                                ).isoformat()
+                                rule['num2'] = None
+                    elif rule['_type'] == 'year':
+                        # Year column: integer year inputs (no .0 suffix)
+                        coerced = pd.to_numeric(series, errors="coerce").dropna()
+                        col_min = int(coerced.min()) if len(coerced) else datetime.now().year
+                        col_max = int(coerced.max()) if len(coerced) else datetime.now().year
+                        st.caption(
+                            f"`{chosen_col}` ranges from {col_min} to {col_max} "
+                            f"({len(coerced):,} year values)."
                         )
-                        rule['num2'] = c_hi.number_input(
-                            "To", value=float(hi_default), key=f"f_num2_{i}"
-                        )
+                        if rule['op'] == "between":
+                            lo_default = int(rule.get('num1') if rule.get('num1') is not None else col_min)
+                            hi_default = int(rule.get('num2') if rule.get('num2') is not None else col_max)
+                            c_lo, c_hi = st.columns(2)
+                            rule['num1'] = c_lo.number_input(
+                                "From", value=lo_default, step=1, format="%d", key=f"f_num1_{i}"
+                            )
+                            rule['num2'] = c_hi.number_input(
+                                "To", value=hi_default, step=1, format="%d", key=f"f_num2_{i}"
+                            )
+                        else:
+                            default = int(rule.get('num1') if rule.get('num1') is not None else col_min)
+                            rule['num1'] = st.number_input(
+                                "Value", value=default, step=1, format="%d", key=f"f_num1_{i}"
+                            )
+                            rule['num2'] = None
                     else:
-                        default = rule.get('num1') if rule.get('num1') is not None else col_min
-                        rule['num1'] = st.number_input(
-                            "Value", value=float(default), key=f"f_num1_{i}"
+                        # Plain numeric column
+                        coerced = pd.to_numeric(series, errors="coerce").dropna()
+                        col_min = float(coerced.min()) if len(coerced) else 0.0
+                        col_max = float(coerced.max()) if len(coerced) else 0.0
+                        st.caption(
+                            f"`{chosen_col}` ranges from "
+                            f"{display_value(col_min)} to {display_value(col_max)} "
+                            f"({len(coerced):,} numeric values)."
                         )
-                        rule['num2'] = None
+                        if rule['op'] == "between":
+                            lo_default = rule.get('num1') if rule.get('num1') is not None else col_min
+                            hi_default = rule.get('num2') if rule.get('num2') is not None else col_max
+                            c_lo, c_hi = st.columns(2)
+                            rule['num1'] = c_lo.number_input(
+                                "From", value=float(lo_default), key=f"f_num1_{i}"
+                            )
+                            rule['num2'] = c_hi.number_input(
+                                "To", value=float(hi_default), key=f"f_num2_{i}"
+                            )
+                        else:
+                            default = rule.get('num1') if rule.get('num1') is not None else col_min
+                            rule['num1'] = st.number_input(
+                                "Value", value=float(default), key=f"f_num1_{i}"
+                            )
+                            rule['num2'] = None
                 else:
                     # Values mode: build options from the column with year-aware
                     # display so 2024 doesn't show as 2024.0
@@ -1180,31 +1324,43 @@ if uploaded_file:
             kind = rule.get('kind', 'Values')
             mask = None
 
-            if kind == "Number rule":
+            # Backwards-compat: old rule kind was called "Number rule"
+            if kind in ("Range / comparison", "Number rule"):
                 op = rule.get('op')
                 n1 = rule.get('num1')
                 n2 = rule.get('num2')
                 if op is None or n1 is None:
                     continue
-                col_numeric = pd.to_numeric(df_active[col], errors="coerce")
-                if op == "=":
-                    mask = col_numeric == n1
-                elif op == "≥":
-                    mask = col_numeric >= n1
-                elif op == "≤":
-                    mask = col_numeric <= n1
-                elif op == ">":
-                    mask = col_numeric > n1
-                elif op == "<":
-                    mask = col_numeric < n1
-                elif op == "between":
-                    if n2 is None:
+
+                rtype = rule.get('_type', 'number')
+                if rtype == 'date':
+                    col_vals = to_dates(df_active[col])
+                    # n1/n2 stored as ISO date strings - parse to Timestamps
+                    try:
+                        v1 = pd.to_datetime(n1)
+                        v2 = pd.to_datetime(n2) if n2 is not None else None
+                    except Exception:
                         continue
-                    lo, hi = (n1, n2) if n1 <= n2 else (n2, n1)
-                    mask = (col_numeric >= lo) & (col_numeric <= hi)
-                # Rows where the value couldn't be coerced to a number must not
-                # pass an Include rule (NaN comparisons return False, so that
-                # naturally falls out - but make it explicit for safety).
+                else:
+                    col_vals = pd.to_numeric(df_active[col], errors="coerce")
+                    v1, v2 = n1, n2
+
+                if op == "=":
+                    mask = col_vals == v1
+                elif op == "≥":
+                    mask = col_vals >= v1
+                elif op == "≤":
+                    mask = col_vals <= v1
+                elif op == ">":
+                    mask = col_vals > v1
+                elif op == "<":
+                    mask = col_vals < v1
+                elif op == "between":
+                    if v2 is None:
+                        continue
+                    lo, hi = (v1, v2) if v1 <= v2 else (v2, v1)
+                    mask = (col_vals >= lo) & (col_vals <= hi)
+                # NaN/NaT comparisons return False but be explicit for safety
                 if mask is not None:
                     mask = mask.fillna(False)
             else:
@@ -1280,6 +1436,19 @@ if uploaded_file:
                         f"Buzzword column (counted once)."
                     )
 
+            # IS-8 toggle: high-level Industrial Strategy 8 categories aggregate
+            # many specific tags and usually dominate the top of the chart.
+            # Default on (include them); flip off to compare specific tags.
+            include_is8 = st.checkbox(
+                "Include IS-8 categories",
+                value=True,
+                key="include_is8",
+                help="The Industrial Strategy 8 (Advanced manufacturing, Clean energy, "
+                     "Creative industries, Defence, Digital and technologies, Financial services, "
+                     "Life sciences, Professional and business services). They aggregate many "
+                     "specific tags, so excluding them surfaces narrower categories."
+            )
+
         if use_auto_wide:
             layout = layout_auto
         else:
@@ -1321,6 +1490,14 @@ if uploaded_file:
         metric_series = process_industry_buzzword(
             df_active, layout, amount_choice if ranking_by != "Count" else None
         )
+        if not include_is8 and len(metric_series):
+            # Case-insensitive drop of the eight Industrial Strategy categories
+            before = len(metric_series)
+            keep = [idx for idx in metric_series.index if str(idx).lower() not in _IS_8_LOWER]
+            metric_series = metric_series.loc[keep]
+            removed = before - len(metric_series)
+            if removed > 0:
+                st.caption(f"IS-8 categories excluded ({removed} removed from ranking).")
         agg_label = ranking_by
     else:
         # Defensive: if Streamlit's widget state retains a stale column name
