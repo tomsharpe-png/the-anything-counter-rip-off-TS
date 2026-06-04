@@ -1241,6 +1241,301 @@ def build_combined_csv_table(metric_series, final_series, unknown_count, item_la
     return combined
 
 
+def _render_filter_editor_body(df, current_source):
+    """Render the Raw Data Filters UI.
+
+    Wrapped with @st.fragment below so widget interactions inside don't trigger
+    a full app rerun - only this section rerenders. The Apply button lives
+    OUTSIDE the fragment, so clicking it triggers a normal full rerun that
+    rebuilds df_active and refreshes the chart.
+
+    Side effects:
+      st.session_state.rules         - mutated by Add/Remove/per-rule widgets
+      st.session_state["_active_only_state"]  - the Active-only checkbox value
+      st.session_state["_active_col_state"]   - the chosen status column
+    """
+    # === Active filter (auto-detect + manual override) ===
+    status_cols_auto = find_companies_house_status_columns(df.columns)
+    if not status_cols_auto:
+        status_cols_auto = [c for c in df.columns if looks_like_status_values(df[c])]
+
+    active_only = st.checkbox(
+        "Active companies only",
+        value=False,
+        key="filter_active_only",
+        help="Include only rows where Companies House status is 'Active' or "
+             "'Dormant Company'. Auto-detects the status column; pick one "
+             "manually if your export uses a non-standard name. Combined "
+             "with your other filters using AND."
+    )
+    chosen_status_col = None
+    if active_only:
+        other_cols = [c for c in df.columns if c not in status_cols_auto]
+        options = ["<None>"] + list(status_cols_auto) + list(other_cols)
+        default_idx = 1 if status_cols_auto else 0
+        chosen_status_col = st.selectbox(
+            "Status column",
+            options,
+            index=default_idx,
+            key="filter_active_status_col",
+            help="Auto-detected columns are listed first. Pick a different "
+                 "one if your export uses a non-standard name."
+        )
+        if chosen_status_col == "<None>":
+            chosen_status_col = None
+        elif chosen_status_col in df.columns:
+            vals_lower = df[chosen_status_col].astype(str).str.strip().str.lower()
+            n_active = int(vals_lower.isin(_ACTIVE_STATUSES).sum())
+            if n_active == 0:
+                distinct = df[chosen_status_col].dropna().astype(str).str.strip().unique().tolist()[:5]
+                st.warning(
+                    f"No rows in `{chosen_status_col}` have a value of "
+                    f"'Active' or 'Dormant Company'. Sample values: "
+                    f"{', '.join(repr(v) for v in distinct)}."
+                )
+            else:
+                st.caption(
+                    f"Of {len(df):,} rows, {n_active:,} have status "
+                    f"'Active' or 'Dormant Company'."
+                )
+    # Stash state so the outer (full-rerun) scope can read it after Apply
+    st.session_state["_active_only_state"] = active_only
+    st.session_state["_active_col_state"] = chosen_status_col
+
+    # === Add / Remove filter rule buttons ===
+    c1, c2 = st.columns(2)
+    if c1.button("➕ Add filter"):
+        st.session_state.rules.append({
+            'col': df.columns[0], 'mode': 'Include', 'kind': 'Values',
+            'vals': [], 'op': '≥', 'num1': None, 'num2': None, '_type': 'number',
+        })
+    if c2.button("➖ Remove last"):
+        if st.session_state.rules:
+            st.session_state.rules.pop()
+
+    # === Per-rule editor ===
+    df_cols = list(df.columns.astype(str))
+    for i, rule in enumerate(st.session_state.rules):
+        label = f"Filter {i+1}: {rule.get('col', '(pick a column)')}"
+        with st.expander(label, expanded=True):
+            current_col = rule.get('col')
+            if current_col not in df_cols:
+                current_col = df_cols[0]
+            col_idx = df_cols.index(current_col)
+
+            chosen_col = st.selectbox(
+                "Column",
+                df_cols,
+                index=col_idx,
+                key=f"f_col_{i}",
+                help="Column to filter on."
+            )
+            rule['col'] = chosen_col
+
+            series = df[chosen_col]
+            # Column-type metadata is cached per (data source, column) so we
+            # don't re-detect date/year/numeric on every fragment rerun.
+            _meta_key = ("_colmeta", current_source, chosen_col)
+            if _meta_key not in st.session_state:
+                is_year_v = is_year_column(chosen_col, series)
+                is_date_v = is_date_like(series) and not is_year_v
+                is_num_v = is_numeric_column(series) and not is_year_v and not is_date_v
+                st.session_state[_meta_key] = (is_year_v, is_date_v, is_num_v)
+            is_year, is_date, is_num = st.session_state[_meta_key]
+
+            kinds = ["Values"]
+            if is_num or is_year or is_date:
+                kinds.append("Range / comparison")
+
+            if rule.get('kind', 'Values') not in kinds:
+                rule['kind'] = kinds[0]
+            if len(kinds) > 1:
+                rule['kind'] = st.radio(
+                    "Filter type",
+                    kinds,
+                    index=kinds.index(rule['kind']),
+                    key=f"f_kind_{i}",
+                    horizontal=True,
+                    help="Pick specific values, or apply a range. "
+                         "Ranges work for numbers, years, and dates."
+                )
+            else:
+                rule['kind'] = kinds[0]
+
+            rule['mode'] = st.radio(
+                "Action",
+                ["Include", "Exclude"],
+                index=0 if rule.get('mode', 'Include') == 'Include' else 1,
+                key=f"f_mode_{i}",
+                horizontal=True,
+            )
+
+            if rule['kind'] == "Range / comparison":
+                if is_date:
+                    rule['_type'] = 'date'
+                elif is_year:
+                    rule['_type'] = 'year'
+                else:
+                    rule['_type'] = 'number'
+
+                ops = ["=", "≥", "≤", ">", "<", "between"]
+                rule['op'] = st.selectbox(
+                    "Comparison",
+                    ops,
+                    index=ops.index(rule.get('op')) if rule.get('op') in ops else (5 if rule['_type'] == 'date' else 1),
+                    key=f"f_op_{i}",
+                )
+
+                if rule['_type'] == 'date':
+                    iso_series = to_iso_date_series(series).dropna()
+                    if not len(iso_series):
+                        st.caption(f"`{chosen_col}` has no parseable dates.")
+                        rule['num1'] = None
+                        rule['num2'] = None
+                    else:
+                        col_min_iso = iso_series.min()
+                        col_max_iso = iso_series.max()
+                        col_min = _iso_to_date(col_min_iso)
+                        col_max = _iso_to_date(col_max_iso)
+                        st.caption(
+                            f"`{chosen_col}` ranges from {col_min_iso} to "
+                            f"{col_max_iso} ({len(iso_series):,} dated values)."
+                        )
+
+                        def _coerce_date(v, fallback):
+                            if v is None:
+                                return fallback
+                            if isinstance(v, date) and not isinstance(v, datetime):
+                                return v
+                            if isinstance(v, datetime):
+                                return v.date()
+                            if hasattr(v, "date") and callable(v.date):
+                                try:
+                                    return v.date()
+                                except Exception:
+                                    pass
+                            iso = _parse_to_iso_date(v)
+                            parsed = _iso_to_date(iso) if iso else None
+                            return parsed if parsed else fallback
+
+                        DATE_PICKER_MIN = date(1, 1, 1)
+                        DATE_PICKER_MAX = date(9999, 12, 31)
+                        if rule['op'] == "between":
+                            lo_default = _coerce_date(rule.get('num1'), col_min)
+                            hi_default = _coerce_date(rule.get('num2'), col_max)
+                            c_lo, c_hi = st.columns(2)
+                            rule['num1'] = c_lo.date_input(
+                                "From", value=lo_default,
+                                min_value=DATE_PICKER_MIN, max_value=DATE_PICKER_MAX,
+                                key=f"f_num1_{i}"
+                            ).isoformat()
+                            rule['num2'] = c_hi.date_input(
+                                "To", value=hi_default,
+                                min_value=DATE_PICKER_MIN, max_value=DATE_PICKER_MAX,
+                                key=f"f_num2_{i}"
+                            ).isoformat()
+                        else:
+                            default = _coerce_date(rule.get('num1'), col_min)
+                            rule['num1'] = st.date_input(
+                                "Value", value=default,
+                                min_value=DATE_PICKER_MIN, max_value=DATE_PICKER_MAX,
+                                key=f"f_num1_{i}"
+                            ).isoformat()
+                            rule['num2'] = None
+                elif rule['_type'] == 'year':
+                    coerced = pd.to_numeric(series, errors="coerce").dropna()
+                    col_min = int(coerced.min()) if len(coerced) else datetime.now().year
+                    col_max = int(coerced.max()) if len(coerced) else datetime.now().year
+                    st.caption(
+                        f"`{chosen_col}` ranges from {col_min} to {col_max} "
+                        f"({len(coerced):,} year values)."
+                    )
+                    if rule['op'] == "between":
+                        lo_default = int(rule.get('num1') if rule.get('num1') is not None else col_min)
+                        hi_default = int(rule.get('num2') if rule.get('num2') is not None else col_max)
+                        c_lo, c_hi = st.columns(2)
+                        rule['num1'] = c_lo.number_input(
+                            "From", value=lo_default, step=1, format="%d", key=f"f_num1_{i}"
+                        )
+                        rule['num2'] = c_hi.number_input(
+                            "To", value=hi_default, step=1, format="%d", key=f"f_num2_{i}"
+                        )
+                    else:
+                        default = int(rule.get('num1') if rule.get('num1') is not None else col_min)
+                        rule['num1'] = st.number_input(
+                            "Value", value=default, step=1, format="%d", key=f"f_num1_{i}"
+                        )
+                        rule['num2'] = None
+                else:
+                    coerced = pd.to_numeric(series, errors="coerce").dropna()
+                    col_min = float(coerced.min()) if len(coerced) else 0.0
+                    col_max = float(coerced.max()) if len(coerced) else 0.0
+                    st.caption(
+                        f"`{chosen_col}` ranges from "
+                        f"{display_value(col_min)} to {display_value(col_max)} "
+                        f"({len(coerced):,} numeric values)."
+                    )
+                    if rule['op'] == "between":
+                        lo_default = rule.get('num1') if rule.get('num1') is not None else col_min
+                        hi_default = rule.get('num2') if rule.get('num2') is not None else col_max
+                        c_lo, c_hi = st.columns(2)
+                        rule['num1'] = c_lo.number_input(
+                            "From", value=float(lo_default), key=f"f_num1_{i}"
+                        )
+                        rule['num2'] = c_hi.number_input(
+                            "To", value=float(hi_default), key=f"f_num2_{i}"
+                        )
+                    else:
+                        default = rule.get('num1') if rule.get('num1') is not None else col_min
+                        rule['num1'] = st.number_input(
+                            "Value", value=float(default), key=f"f_num1_{i}"
+                        )
+                        rule['num2'] = None
+            else:
+                # Values mode
+                non_null = series.dropna()
+                if len(non_null) == 0:
+                    st.caption(f"`{chosen_col}` has no non-empty values.")
+                    rule['vals'] = []
+                else:
+                    disp = display_series(non_null, is_year=is_year)
+                    unique_vals = disp[disp != ""].unique().tolist()
+                    if len(unique_vals) > 5000:
+                        st.caption(
+                            f"`{chosen_col}` has {len(unique_vals):,} unique values — "
+                            f"showing the 5,000 most common."
+                        )
+                        top = disp[disp != ""].value_counts().head(5000).index.tolist()
+                        opts = sorted(top)
+                    else:
+                        try:
+                            opts = sorted(unique_vals, key=lambda v: (0, float(v)))
+                        except (ValueError, TypeError):
+                            opts = sorted(unique_vals)
+                    prev = [v for v in rule.get('vals', []) if v in opts]
+                    rule['vals'] = st.multiselect(
+                        "Values to include / exclude",
+                        opts,
+                        default=prev,
+                        key=f"f_vals_{i}",
+                        help=f"{len(opts):,} option{'s' if len(opts) != 1 else ''} available."
+                    )
+                rule['op'] = None
+                rule['num1'] = None
+                rule['num2'] = None
+
+
+# Wrap the filter editor with @st.fragment when available (Streamlit ≥ 1.37).
+# This is the meat of the perceived-speed improvement: widget interactions
+# inside the filter editor only re-render the filter editor, not the entire
+# script. The chart, downloads, and metric computation stay as they were.
+# Older Streamlit versions fall through to a normal full rerun.
+if hasattr(st, "fragment"):
+    render_filter_editor = st.fragment(_render_filter_editor_body)
+else:
+    render_filter_editor = _render_filter_editor_body
+
+
 # ========================= APP START =========================
 st.markdown(f'<h1 style="color:{APP_TITLE_COLOR};">Ranklin</h1>', unsafe_allow_html=True)
 
@@ -1334,305 +1629,25 @@ if uploaded_file:
         if 'rules' not in st.session_state:
             st.session_state.rules = []
 
-        # One-click Active filter. Auto-detects 'Companies House status'
-        # columns; if none found, the user can manually point at any column.
-        # This means the filter is always available regardless of export
-        # column naming.
-        status_cols_auto = find_companies_house_status_columns(df.columns)
-        # Value-based fallback for columns that don't follow naming convention
-        if not status_cols_auto:
-            status_cols_auto = [c for c in df.columns if looks_like_status_values(df[c])]
-
-        active_only = st.checkbox(
-            "Active companies only",
-            value=False,
-            key="filter_active_only",
-            help="Include only rows where Companies House status is 'Active' "
-                 "or 'Dormant Company'. Auto-detects the status column; if not "
-                 "found, you can pick one manually below. Combined with your "
-                 "other filters using AND."
-        )
-        chosen_status_col = None
-        if active_only:
-            # Build the options list. Put auto-detected columns at the top,
-            # then everything else - so the user can always override.
-            other_cols = [c for c in df.columns if c not in status_cols_auto]
-            options = ["<None>"] + list(status_cols_auto) + list(other_cols)
-            default_idx = 1 if status_cols_auto else 0
-            chosen_status_col = st.selectbox(
-                "Status column",
-                options,
-                index=default_idx,
-                key="filter_active_status_col",
-                help="Auto-detected columns are listed first. Pick a different "
-                     "one if your export uses a non-standard name."
-            )
-            if chosen_status_col == "<None>":
-                chosen_status_col = None
-            elif chosen_status_col in df.columns:
-                # Show how many rows would survive so the user can sanity-check
-                vals_lower = df[chosen_status_col].astype(str).str.strip().str.lower()
-                n_active = int(vals_lower.isin(_ACTIVE_STATUSES).sum())
-                if n_active == 0:
-                    distinct = df[chosen_status_col].dropna().astype(str).str.strip().unique().tolist()[:5]
-                    st.warning(
-                        f"No rows in `{chosen_status_col}` have a value of "
-                        f"'Active' or 'Dormant Company'. Sample values: "
-                        f"{', '.join(repr(v) for v in distinct)}. "
-                        f"This filter will exclude every row when applied."
-                    )
-                else:
-                    st.caption(
-                        f"Of {len(df):,} rows, {n_active:,} have status "
-                        f"'Active' or 'Dormant Company'."
-                    )
-
-        c1, c2 = st.columns(2)
-        if c1.button("➕ Add filter"):
-            st.session_state.rules.append({
-                'col': df.columns[0], 'mode': 'Include', 'kind': 'Values',
-                'vals': [], 'op': '≥', 'num1': None, 'num2': None, '_type': 'number',
-            })
-        if c2.button("➖ Remove last"):
-            if st.session_state.rules:
-                st.session_state.rules.pop()
-
-        df_cols = list(df.columns.astype(str))
-        for i, rule in enumerate(st.session_state.rules):
-            label = f"Filter {i+1}: {rule.get('col', '(pick a column)')}"
-            with st.expander(label, expanded=True):
-                current_col = rule.get('col')
-                if current_col not in df_cols:
-                    current_col = df_cols[0]
-                col_idx = df_cols.index(current_col)
-
-                chosen_col = st.selectbox(
-                    "Column",
-                    df_cols,
-                    index=col_idx,
-                    key=f"f_col_{i}",
-                    help="Column to filter on."
-                )
-                rule['col'] = chosen_col
-
-                series = df[chosen_col]
-                # Column-type detection (is_year / is_date / is_num) used to run
-                # on every rerun for every filter rule - ~20ms per column with
-                # date parsing, ~60ms total for 3 filter rules. Cache the result
-                # in session state keyed by (data source, column name); the
-                # source-change handler clears these when the user switches
-                # sheets or re-uploads, so we never serve stale metadata.
-                _meta_key = ("_colmeta", current_source, chosen_col)
-                if _meta_key not in st.session_state:
-                    is_year_v = is_year_column(chosen_col, series)
-                    is_date_v = is_date_like(series) and not is_year_v
-                    is_num_v = is_numeric_column(series) and not is_year_v and not is_date_v
-                    st.session_state[_meta_key] = (is_year_v, is_date_v, is_num_v)
-                is_year, is_date, is_num = st.session_state[_meta_key]
-
-                # Filter "kind" - pick specific values or apply a range/comparison
-                # rule. Range/comparison works for numbers, years, and dates -
-                # the input widgets adapt to the column type.
-                kinds = ["Values"]
-                if is_num or is_year or is_date:
-                    kinds.append("Range / comparison")
-
-                if rule.get('kind', 'Values') not in kinds:
-                    rule['kind'] = kinds[0]
-                if len(kinds) > 1:
-                    rule['kind'] = st.radio(
-                        "Filter type",
-                        kinds,
-                        index=kinds.index(rule['kind']),
-                        key=f"f_kind_{i}",
-                        horizontal=True,
-                        help="Pick specific values, or apply a range (=, ≥, ≤, >, <, between). "
-                             "Ranges work for numbers, years, and dates."
-                    )
-                else:
-                    rule['kind'] = kinds[0]
-
-                rule['mode'] = st.radio(
-                    "Action",
-                    ["Include", "Exclude"],
-                    index=0 if rule.get('mode', 'Include') == 'Include' else 1,
-                    key=f"f_mode_{i}",
-                    horizontal=True,
-                )
-
-                if rule['kind'] == "Range / comparison":
-                    # Record the column type on the rule so the eval code knows
-                    # how to coerce values consistently.
-                    if is_date:
-                        rule['_type'] = 'date'
-                    elif is_year:
-                        rule['_type'] = 'year'
-                    else:
-                        rule['_type'] = 'number'
-
-                    ops = ["=", "≥", "≤", ">", "<", "between"]
-                    rule['op'] = st.selectbox(
-                        "Comparison",
-                        ops,
-                        index=ops.index(rule.get('op')) if rule.get('op') in ops else (5 if rule['_type'] == 'date' else 1),
-                        key=f"f_op_{i}",
-                    )
-
-                    if rule['_type'] == 'date':
-                        # Use ISO string conversion so dates outside pandas'
-                        # nanosecond range (pre-1677, post-2262) still work.
-                        iso_series = to_iso_date_series(series).dropna()
-                        if not len(iso_series):
-                            st.caption(f"`{chosen_col}` has no parseable dates.")
-                            rule['num1'] = None
-                            rule['num2'] = None
-                        else:
-                            # ISO strings sort lexicographically the same way
-                            # dates sort chronologically (year zero-padded).
-                            col_min_iso = iso_series.min()
-                            col_max_iso = iso_series.max()
-                            col_min = _iso_to_date(col_min_iso)
-                            col_max = _iso_to_date(col_max_iso)
-                            st.caption(
-                                f"`{chosen_col}` ranges from {col_min_iso} to "
-                                f"{col_max_iso} ({len(iso_series):,} dated values)."
-                            )
-
-                            def _coerce_date(v, fallback):
-                                if v is None:
-                                    return fallback
-                                if isinstance(v, date) and not isinstance(v, datetime):
-                                    return v
-                                if isinstance(v, datetime):
-                                    return v.date()
-                                if hasattr(v, "date") and callable(v.date):
-                                    try:
-                                        return v.date()
-                                    except Exception:
-                                        pass
-                                iso = _parse_to_iso_date(v)
-                                parsed = _iso_to_date(iso) if iso else None
-                                return parsed if parsed else fallback
-
-                            # Open up the picker bounds all the way to Python's
-                            # date limits so dates back to year 1 AD and forward
-                            # to 9999 AD are selectable. Required because some
-                            # historical datasets go back to year 570 or earlier.
-                            DATE_PICKER_MIN = date(1, 1, 1)
-                            DATE_PICKER_MAX = date(9999, 12, 31)
-                            if rule['op'] == "between":
-                                lo_default = _coerce_date(rule.get('num1'), col_min)
-                                hi_default = _coerce_date(rule.get('num2'), col_max)
-                                c_lo, c_hi = st.columns(2)
-                                rule['num1'] = c_lo.date_input(
-                                    "From", value=lo_default,
-                                    min_value=DATE_PICKER_MIN, max_value=DATE_PICKER_MAX,
-                                    key=f"f_num1_{i}"
-                                ).isoformat()
-                                rule['num2'] = c_hi.date_input(
-                                    "To", value=hi_default,
-                                    min_value=DATE_PICKER_MIN, max_value=DATE_PICKER_MAX,
-                                    key=f"f_num2_{i}"
-                                ).isoformat()
-                            else:
-                                default = _coerce_date(rule.get('num1'), col_min)
-                                rule['num1'] = st.date_input(
-                                    "Value", value=default,
-                                    min_value=DATE_PICKER_MIN, max_value=DATE_PICKER_MAX,
-                                    key=f"f_num1_{i}"
-                                ).isoformat()
-                                rule['num2'] = None
-                    elif rule['_type'] == 'year':
-                        # Year column: integer year inputs (no .0 suffix)
-                        coerced = pd.to_numeric(series, errors="coerce").dropna()
-                        col_min = int(coerced.min()) if len(coerced) else datetime.now().year
-                        col_max = int(coerced.max()) if len(coerced) else datetime.now().year
-                        st.caption(
-                            f"`{chosen_col}` ranges from {col_min} to {col_max} "
-                            f"({len(coerced):,} year values)."
-                        )
-                        if rule['op'] == "between":
-                            lo_default = int(rule.get('num1') if rule.get('num1') is not None else col_min)
-                            hi_default = int(rule.get('num2') if rule.get('num2') is not None else col_max)
-                            c_lo, c_hi = st.columns(2)
-                            rule['num1'] = c_lo.number_input(
-                                "From", value=lo_default, step=1, format="%d", key=f"f_num1_{i}"
-                            )
-                            rule['num2'] = c_hi.number_input(
-                                "To", value=hi_default, step=1, format="%d", key=f"f_num2_{i}"
-                            )
-                        else:
-                            default = int(rule.get('num1') if rule.get('num1') is not None else col_min)
-                            rule['num1'] = st.number_input(
-                                "Value", value=default, step=1, format="%d", key=f"f_num1_{i}"
-                            )
-                            rule['num2'] = None
-                    else:
-                        # Plain numeric column
-                        coerced = pd.to_numeric(series, errors="coerce").dropna()
-                        col_min = float(coerced.min()) if len(coerced) else 0.0
-                        col_max = float(coerced.max()) if len(coerced) else 0.0
-                        st.caption(
-                            f"`{chosen_col}` ranges from "
-                            f"{display_value(col_min)} to {display_value(col_max)} "
-                            f"({len(coerced):,} numeric values)."
-                        )
-                        if rule['op'] == "between":
-                            lo_default = rule.get('num1') if rule.get('num1') is not None else col_min
-                            hi_default = rule.get('num2') if rule.get('num2') is not None else col_max
-                            c_lo, c_hi = st.columns(2)
-                            rule['num1'] = c_lo.number_input(
-                                "From", value=float(lo_default), key=f"f_num1_{i}"
-                            )
-                            rule['num2'] = c_hi.number_input(
-                                "To", value=float(hi_default), key=f"f_num2_{i}"
-                            )
-                        else:
-                            default = rule.get('num1') if rule.get('num1') is not None else col_min
-                            rule['num1'] = st.number_input(
-                                "Value", value=float(default), key=f"f_num1_{i}"
-                            )
-                            rule['num2'] = None
-                else:
-                    # Values mode: build options from the column with year-aware
-                    # display so 2024 doesn't show as 2024.0
-                    non_null = series.dropna()
-                    if len(non_null) == 0:
-                        st.caption(f"`{chosen_col}` has no non-empty values.")
-                        rule['vals'] = []
-                    else:
-                        disp = display_series(non_null, is_year=is_year)
-                        unique_vals = disp[disp != ""].unique().tolist()
-                        if len(unique_vals) > 5000:
-                            st.caption(
-                                f"`{chosen_col}` has {len(unique_vals):,} unique values — "
-                                f"showing the 5,000 most common."
-                            )
-                            top = disp[disp != ""].value_counts().head(5000).index.tolist()
-                            opts = sorted(top)
-                        else:
-                            # Sort numerically when the column is year-like or numeric-looking
-                            try:
-                                opts = sorted(unique_vals, key=lambda v: (0, float(v)))
-                            except (ValueError, TypeError):
-                                opts = sorted(unique_vals)
-                        prev = [v for v in rule.get('vals', []) if v in opts]
-                        rule['vals'] = st.multiselect(
-                            "Values to include / exclude",
-                            opts,
-                            default=prev,
-                            key=f"f_vals_{i}",
-                            help=f"{len(opts):,} option{'s' if len(opts) != 1 else ''} available."
-                        )
-                    rule['op'] = None
-                    rule['num1'] = None
-                    rule['num2'] = None
+        # The filter editor is wrapped in @st.fragment so widget interactions
+        # inside (column picker, value multiselect, range inputs, Add/Remove
+        # rule buttons) only re-render this section - not the chart or the
+        # downstream computations. The APPLY CHANGES button below sits OUTSIDE
+        # the fragment, so clicking it triggers a normal full rerun that
+        # rebuilds df_active from the new rules.
+        render_filter_editor(df, current_source)
 
         st.markdown('<div class="apply-btn">', unsafe_allow_html=True)
         apply_trigger = st.button("🚀 APPLY CHANGES", use_container_width=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
     # Filtering Execution
+    # The Active-only checkbox and status-column dropdown live inside the
+    # filter editor fragment, which writes its state to session_state. Read
+    # the latest values from there before rebuilding df_active.
+    active_only = bool(st.session_state.get("_active_only_state", False))
+    chosen_status_col = st.session_state.get("_active_col_state", None)
+
     if apply_trigger or source_changed or 'df_active' not in st.session_state:
         df_active = df.copy()
         # One-click Active filter (applied before the manual rule list so
