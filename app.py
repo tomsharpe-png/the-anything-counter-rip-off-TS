@@ -697,14 +697,17 @@ def plot_bar(labels, values, title, highlight_first=True, right_formatter=lambda
 
 @st.cache_data(show_spinner=False, max_entries=10)
 def render_chart_bytes(labels_tuple, values_tuple, title, highlight_first, fmt_kind):
-    """Render the inline chart once per unique input combination.
+    """Render the inline chart PNG once per unique input combination.
 
-    Returns (display_png_bytes, svg_bytes). The PNG is rendered at 150 DPI -
-    plenty of resolution for the in-app display (~1500x900 pixels), and 3x
-    faster to generate than 300 DPI. The hi-res download PNG is rendered
-    separately by _render_hires_png_lazy, which is only invoked when the user
-    actually clicks the PNG download button (via the callable-data feature
-    of st.download_button).
+    Returns the display PNG bytes only. 100 DPI keeps render time around
+    ~80-100ms (vs ~130-200ms at 150-200 DPI) while still producing a 1000x600
+    image - enough resolution for inline browser display, since st.image
+    resizes to the container width.
+
+    The SVG and 300 DPI PNG downloads are rendered LAZILY by separate
+    functions, only when the user clicks their download button. This means
+    that during normal chart updates (changing exclusions, top-N, ranking
+    order), only the cheap 100 DPI PNG is rendered.
 
     Tuples are used for the labels/values arguments so the cache key is hashable.
     """
@@ -713,21 +716,35 @@ def render_chart_bytes(labels_tuple, values_tuple, title, highlight_first, fmt_k
     fmt_fn = money_fmt if fmt_kind == "money" else (lambda x: f"{int(x):,}")
     fig = plot_bar(labels, values, title, highlight_first=highlight_first, right_formatter=fmt_fn)
     png = io.BytesIO()
-    fig.savefig(png, format="png", bbox_inches="tight", dpi=150)
+    fig.savefig(png, format="png", bbox_inches="tight", dpi=100)
+    plt.close(fig)
+    return png.getvalue()
+
+
+@st.cache_data(show_spinner=False, max_entries=5)
+def _render_svg(labels_tuple, values_tuple, title, highlight_first, fmt_kind):
+    """Render an SVG of the chart. Lazy - only called when user clicks SVG download.
+
+    Vector format ideal for Adobe and publication-quality output. Render time
+    ~80-90ms but only invoked once per download click, not per rerun.
+    """
+    labels = list(labels_tuple)
+    values = list(values_tuple)
+    fmt_fn = money_fmt if fmt_kind == "money" else (lambda x: f"{int(x):,}")
+    fig = plot_bar(labels, values, title, highlight_first=highlight_first, right_formatter=fmt_fn)
     svg = io.BytesIO()
     fig.savefig(svg, format="svg", bbox_inches="tight", transparent=True)
     plt.close(fig)
-    return png.getvalue(), svg.getvalue()
+    return svg.getvalue()
 
 
 @st.cache_data(show_spinner=False, max_entries=5)
 def _render_hires_png(labels_tuple, values_tuple, title, highlight_first, fmt_kind):
-    """Render a 300 DPI PNG for download (~3000x1800 pixels).
+    """Render a 300 DPI PNG for download (~3000x1800 pixels). Lazy.
 
-    Slow - matplotlib's 300 DPI savefig is the dominant cost when chart inputs
-    change (~250-400ms). To keep the in-app experience snappy this is only
-    invoked when the user actually clicks the 'PNG (High Res)' download button,
-    via st.download_button's callable-data feature.
+    Slow - 300 DPI savefig takes ~250ms. Only invoked when the user clicks
+    the 'PNG (High Res)' download button, via st.download_button's
+    callable-data feature.
     """
     labels = list(labels_tuple)
     values = list(values_tuple)
@@ -1748,7 +1765,12 @@ if uploaded_file:
             if mask is not None:
                 df_active = df_active[mask] if rule.get('mode', 'Include') == "Include" else df_active[~mask]
         st.session_state.df_active = df_active
+        # Bump a cheap integer cache key. Used downstream to gate metric_series
+        # recomputation - avoids the ~30ms DataFrame hash that @st.cache_data
+        # would do on every rerun even when df_active hasn't changed.
+        st.session_state._df_active_version = st.session_state.get("_df_active_version", 0) + 1
     df_active = st.session_state.df_active
+    _df_active_version = st.session_state.get("_df_active_version", 0)
 
     # --- CALCULATION LOGIC ---
     if mode == "Yes":
@@ -1860,17 +1882,37 @@ if uploaded_file:
             )
             st.stop()
 
-        metric_series = process_industry_buzzword(
-            df_active, layout, amount_choice if ranking_by != "Count" else None
+        # Cache metric_series in session_state to skip @st.cache_data's
+        # DataFrame hashing on reruns where nothing relevant changed. The
+        # version counter changes only when df_active is rebuilt; the other
+        # cache key fields capture every other input that affects metric_series.
+        _metric_key = (
+            "yes", _df_active_version, str(layout),
+            amount_choice if ranking_by != "Count" else None,
+            ranking_by, include_is8,
         )
-        if not include_is8 and len(metric_series):
-            # Case-insensitive drop of the eight Industrial Strategy categories
-            before = len(metric_series)
-            keep = [idx for idx in metric_series.index if str(idx).lower() not in _IS_8_LOWER]
-            metric_series = metric_series.loc[keep]
-            removed = before - len(metric_series)
-            if removed > 0:
-                st.caption(f"IS-8 categories excluded ({removed} removed from ranking).")
+        if st.session_state.get("_metric_key") == _metric_key and "_metric_series" in st.session_state:
+            metric_series = st.session_state["_metric_series"]
+            if not include_is8 and "_is8_removed" in st.session_state and st.session_state["_is8_removed"] > 0:
+                st.caption(
+                    f"IS-8 categories excluded ({st.session_state['_is8_removed']} removed from ranking)."
+                )
+        else:
+            metric_series = process_industry_buzzword(
+                df_active, layout, amount_choice if ranking_by != "Count" else None
+            )
+            if not include_is8 and len(metric_series):
+                before = len(metric_series)
+                keep = [idx for idx in metric_series.index if str(idx).lower() not in _IS_8_LOWER]
+                metric_series = metric_series.loc[keep]
+                removed = before - len(metric_series)
+                st.session_state["_is8_removed"] = removed
+                if removed > 0:
+                    st.caption(f"IS-8 categories excluded ({removed} removed from ranking).")
+            else:
+                st.session_state["_is8_removed"] = 0
+            st.session_state["_metric_series"] = metric_series
+            st.session_state["_metric_key"] = _metric_key
         agg_label = ranking_by
     else:
         # Defensive: if Streamlit's widget state retains a stale column name
@@ -1891,18 +1933,29 @@ if uploaded_file:
             )
             st.stop()
 
-        if analysis_type == "Sum":
-            # Coerce so a text-typed number column (e.g. one containing stray 'N/A')
-            # still sums correctly. Non-numeric values become NaN and are skipped.
-            sum_values = pd.to_numeric(df_active[sum_col], errors="coerce")
-            metric_series = sum_values.groupby(df_active[target_col]).sum()
-            agg_label = "Sum"
+        _metric_key = (
+            "no", _df_active_version, target_col, analysis_type,
+            sum_col if analysis_type == "Sum" else None,
+            explode_enabled, beauhurst_aware,
+        )
+        if st.session_state.get("_metric_key") == _metric_key and "_metric_series" in st.session_state:
+            metric_series = st.session_state["_metric_series"]
+            agg_label = "Sum" if analysis_type == "Sum" else "Count"
         else:
-            if explode_enabled:
-                metric_series = process_generic_explode(df_active, target_col, use_smart_split=beauhurst_aware)
+            if analysis_type == "Sum":
+                # Coerce so a text-typed number column (e.g. one containing stray 'N/A')
+                # still sums correctly. Non-numeric values become NaN and are skipped.
+                sum_values = pd.to_numeric(df_active[sum_col], errors="coerce")
+                metric_series = sum_values.groupby(df_active[target_col]).sum()
+                agg_label = "Sum"
             else:
-                metric_series = df_active[target_col].value_counts()
-            agg_label = "Count"
+                if explode_enabled:
+                    metric_series = process_generic_explode(df_active, target_col, use_smart_split=beauhurst_aware)
+                else:
+                    metric_series = df_active[target_col].value_counts()
+                agg_label = "Count"
+            st.session_state["_metric_series"] = metric_series
+            st.session_state["_metric_key"] = _metric_key
 
     # --- CHART OPTIONS ---
     metric_series = metric_series.sort_values(ascending=False)
@@ -1941,12 +1994,13 @@ if uploaded_file:
         st.warning("No data found.")
     else:
         is_money = (mode == "Yes" and ranking_by != "Count") or (mode == "No" and analysis_type == "Sum")
-        # render_chart_bytes is @st.cache_data-decorated, so identical inputs
-        # return cached PNG/SVG bytes in O(1). When the exclude list or top N
-        # change, the cache misses and matplotlib runs once at 150 DPI for the
-        # inline display (~80-120ms instead of 250-400ms at 300 DPI), plus a
-        # 300 DPI download PNG only when the user actually clicks Download.
-        png_display, svg_bytes = render_chart_bytes(
+        # render_chart_bytes is @st.cache_data-decorated, returning the
+        # display PNG bytes at 100 DPI (~80-100ms cold, near-instant warm).
+        # SVG and 300 DPI PNG are rendered LAZILY via callables passed to the
+        # download buttons - only invoked when the user actually clicks the
+        # respective button. This keeps the chart-update path very light: just
+        # one ~80ms PNG render plus an O(1) byte copy from cache.
+        png_display = render_chart_bytes(
             tuple(str(x) for x in l_chart),
             tuple(float(v) for v in v_chart),
             chart_title,
@@ -1993,22 +2047,27 @@ if uploaded_file:
             filename_stem = safe_filename(filename_stem, default=default_stem)
             st.session_state["_filename_stem"] = filename_stem
 
-            col_a, col_b, col_c = st.columns(3)
-            col_a.download_button("SVG (Adobe)", svg_bytes, f"{filename_stem}.svg", "image/svg+xml")
-            # Hi-res PNG is generated lazily - the callable is only invoked when
-            # the user actually clicks the download button (Streamlit ≥ 1.27).
-            # Captured into local tuples so the closure has stable values rather
-            # than referring to mutating outer-scope variables.
-            _hires_args = (
+            # Lazy download callables - matplotlib only runs when the user
+            # clicks. Captured into local tuples so the closures have stable
+            # values rather than referring to mutating outer-scope variables.
+            _chart_args = (
                 tuple(str(x) for x in l_chart),
                 tuple(float(x) for x in v_chart),
                 chart_title,
                 (rank_mode == "Highest first"),
                 "money" if is_money else "count",
             )
+
+            col_a, col_b, col_c = st.columns(3)
+            col_a.download_button(
+                "SVG (Adobe)",
+                data=lambda a=_chart_args: _render_svg(*a),
+                file_name=f"{filename_stem}.svg",
+                mime="image/svg+xml",
+            )
             col_b.download_button(
                 "PNG (High Res)",
-                data=lambda a=_hires_args: _render_hires_png(*a),
+                data=lambda a=_chart_args: _render_hires_png(*a),
                 file_name=f"{filename_stem}.png",
                 mime="image/png",
             )
