@@ -697,17 +697,16 @@ def plot_bar(labels, values, title, highlight_first=True, right_formatter=lambda
 
 @st.cache_data(show_spinner=False, max_entries=10)
 def render_chart_bytes(labels_tuple, values_tuple, title, highlight_first, fmt_kind):
-    """Render the inline chart PNG once per unique input combination.
+    """Render the inline chart PNG at 200 DPI for crisp display.
 
-    Returns the display PNG bytes only. 100 DPI keeps render time around
-    ~80-100ms (vs ~130-200ms at 150-200 DPI) while still producing a 1000x600
-    image - enough resolution for inline browser display, since st.image
-    resizes to the container width.
+    SVG embedded in Streamlit markdown turns out to render less crisply than
+    the SVG opened as a file (markdown/CSS interactions, viewBox scaling
+    quirks). PNG at 200 DPI is rock-solid: ~2000x1200 pixels, sharp on
+    retina/4K, predictable across browsers. Render time ~200ms cold, instant
+    on cache hit.
 
     The SVG and 300 DPI PNG downloads are rendered LAZILY by separate
-    functions, only when the user clicks their download button. This means
-    that during normal chart updates (changing exclusions, top-N, ranking
-    order), only the cheap 100 DPI PNG is rendered.
+    functions (only on download click) so the inline path stays single-render.
 
     Tuples are used for the labels/values arguments so the cache key is hashable.
     """
@@ -716,7 +715,7 @@ def render_chart_bytes(labels_tuple, values_tuple, title, highlight_first, fmt_k
     fmt_fn = money_fmt if fmt_kind == "money" else (lambda x: f"{int(x):,}")
     fig = plot_bar(labels, values, title, highlight_first=highlight_first, right_formatter=fmt_fn)
     png = io.BytesIO()
-    fig.savefig(png, format="png", bbox_inches="tight", dpi=100)
+    fig.savefig(png, format="png", bbox_inches="tight", dpi=200)
     plt.close(fig)
     return png.getvalue()
 
@@ -725,8 +724,9 @@ def render_chart_bytes(labels_tuple, values_tuple, title, highlight_first, fmt_k
 def _render_svg(labels_tuple, values_tuple, title, highlight_first, fmt_kind):
     """Render an SVG of the chart. Lazy - only called when user clicks SVG download.
 
-    Vector format ideal for Adobe and publication-quality output. Render time
-    ~80-90ms but only invoked once per download click, not per rerun.
+    Vector format ideal for Adobe Illustrator and publication-quality output.
+    Render time ~50-80ms, only invoked once per download click (not per rerun)
+    via st.download_button's callable-data feature.
     """
     labels = list(labels_tuple)
     values = list(values_tuple)
@@ -1604,6 +1604,12 @@ if uploaded_file:
         # the previous sheet's data and produce wrong filter-type detection.
         for k in [k for k in st.session_state if isinstance(k, tuple) and k and k[0] == "_colmeta"]:
             del st.session_state[k]
+        # Reset View Options widget state so the new file starts with the
+        # defaults (top-N=10, no exclusions) rather than carrying over the
+        # last file's choices.
+        for k in ("view_top_n", "view_exclude"):
+            if k in st.session_state:
+                del st.session_state[k]
         st.session_state.data_source = current_source
 
     with st.sidebar:
@@ -1971,11 +1977,27 @@ if uploaded_file:
                  "respect this list; the 'Full' columns ignore it."
         )
         final_series = metric_series.drop(exclude, errors='ignore')
-        top_n = st.number_input(
-            "Number of bars", 1, max(1, len(final_series)),
-            min(10, max(1, len(final_series))),
-            key="view_top_n",
-        )
+        # Top-N slider. Default is 10 (or the full length if there are fewer
+        # than 10 items). Slider beats number_input for "easy to change" -
+        # drag, no clicking the +/- arrows. The widget state is reset when
+        # the data source changes (see the source_changed branch above) so a
+        # fresh file always starts at 10.
+        _series_len = max(1, len(final_series))
+        _slider_max = max(2, min(_series_len, 50))  # cap at 50; slider needs min<max
+        if _series_len == 1:
+            # Edge case: only one item, slider would be degenerate. Just show count.
+            top_n = 1
+            st.caption("Showing the single ranked item.")
+        else:
+            top_n = st.slider(
+                "Number of bars",
+                min_value=1,
+                max_value=_slider_max,
+                value=min(10, _slider_max),
+                step=1,
+                key="view_top_n",
+                help="Drag to change. Caps at 50 - if you need more, export the CSV."
+            )
         rank_mode = st.radio(
             "Order:", ["Highest first", "Lowest first"],
             horizontal=True, key="view_rank_mode",
@@ -1994,12 +2016,9 @@ if uploaded_file:
         st.warning("No data found.")
     else:
         is_money = (mode == "Yes" and ranking_by != "Count") or (mode == "No" and analysis_type == "Sum")
-        # render_chart_bytes is @st.cache_data-decorated, returning the
-        # display PNG bytes at 100 DPI (~80-100ms cold, near-instant warm).
-        # SVG and 300 DPI PNG are rendered LAZILY via callables passed to the
-        # download buttons - only invoked when the user actually clicks the
-        # respective button. This keeps the chart-update path very light: just
-        # one ~80ms PNG render plus an O(1) byte copy from cache.
+        # render_chart_bytes returns a 200 DPI PNG (~2000x1200 pixels) - crisp
+        # on retina/4K displays, predictable across browsers, no markdown
+        # rendering quirks. ~200ms cold, instant on cache hit.
         png_display = render_chart_bytes(
             tuple(str(x) for x in l_chart),
             tuple(float(v) for v in v_chart),
@@ -2047,9 +2066,8 @@ if uploaded_file:
             filename_stem = safe_filename(filename_stem, default=default_stem)
             st.session_state["_filename_stem"] = filename_stem
 
-            # Lazy download callables - matplotlib only runs when the user
-            # clicks. Captured into local tuples so the closures have stable
-            # values rather than referring to mutating outer-scope variables.
+            # Lazy download callables - matplotlib only runs on click.
+            # Captured into local tuples so the closures have stable values.
             _chart_args = (
                 tuple(str(x) for x in l_chart),
                 tuple(float(x) for x in v_chart),
