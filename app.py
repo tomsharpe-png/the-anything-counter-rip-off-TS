@@ -1536,6 +1536,133 @@ else:
     render_filter_editor = _render_filter_editor_body
 
 
+def _render_view_chart_body(
+    metric_series, df_active_len, item_label, value_label,
+    unknown_count, chart_title, is_money,
+):
+    """Render Section 4 (View Options), the chart, and Section 5 (Downloads).
+
+    Wrapped with @st.fragment below so changes to the exclusion multiselect,
+    top-N number, and rank order only re-render this block - not the filter
+    editor or the upstream metric computation. The previous Section 3 rerun
+    work proved this dramatically improves perceived performance, and the
+    same applies here: tweaking chart exclusions used to redraw the entire
+    sidebar; now it touches only what actually changed.
+
+    The arguments are values the fragment treats as immutable inputs - they
+    don't change when the user fiddles with exclusion/top_n/rank order, so
+    they're computed in the outer scope on full reruns and passed in.
+    """
+    # === Section 4: View Options ===
+    with st.sidebar:
+        st.markdown("---")
+        st.header("4. View Options")
+        exclude = st.multiselect(
+            "Exclude from chart:",
+            metric_series.index.tolist(),
+            key="view_exclude",
+            help="Items to drop from the chart. The CSV's 'Chart' columns "
+                 "respect this list; the 'Full' columns ignore it."
+        )
+        final_series = metric_series.drop(exclude, errors='ignore')
+        top_n = st.number_input(
+            "Number of bars",
+            1,
+            max(1, len(final_series)),
+            min(10, max(1, len(final_series))),
+            key="view_top_n",
+        )
+        rank_mode = st.radio(
+            "Order:",
+            ["Highest first", "Lowest first"],
+            horizontal=True,
+            key="view_rank_mode",
+        )
+
+    # Slice to top N
+    l_chart = final_series.index.tolist()
+    v_chart = final_series.values.tolist()
+    if rank_mode == "Lowest first":
+        l_chart, v_chart = l_chart[::-1][:top_n], v_chart[::-1][:top_n]
+    else:
+        l_chart, v_chart = l_chart[:top_n], v_chart[:top_n]
+
+    # === Main area: subheader + chart ===
+    st.subheader(f"Analysis Results ({df_active_len:,} rows)")
+    if not l_chart:
+        st.warning("No data found.")
+        return
+
+    # Cached render - returns PNG and SVG bytes
+    png_bytes, svg_bytes = render_chart_bytes(
+        tuple(str(x) for x in l_chart),
+        tuple(float(v) for v in v_chart),
+        chart_title,
+        (rank_mode == "Highest first"),
+        "money" if is_money else "count",
+    )
+    st.image(png_bytes, use_container_width=True)
+
+    # === Section 5: Downloads ===
+    with st.sidebar:
+        st.markdown("---")
+        st.header("5. Download")
+
+        # Combined CSV: full ranking on the left, chart-matched ranking on the right
+        combined_df = build_combined_csv_table(
+            metric_series, final_series, unknown_count, item_label, value_label
+        )
+        csv_bytes = combined_df.to_csv(index=False).encode("utf-8")
+        chart_exclusion_count = len(metric_series) - len(final_series)
+
+        # Custom filename - defaults to chart title, persists user overrides
+        default_stem = safe_filename(chart_title)
+        if st.session_state.get("_filename_last_default") != default_stem:
+            st.session_state["_filename_stem"] = default_stem
+            st.session_state["_filename_last_default"] = default_stem
+        filename_stem = st.text_input(
+            "Filename (no extension)",
+            value=st.session_state.get("_filename_stem", default_stem),
+            key="filename_stem_input",
+            help="Used for all downloads below. Defaults to the chart title."
+        )
+        filename_stem = safe_filename(filename_stem, default=default_stem)
+        st.session_state["_filename_stem"] = filename_stem
+
+        col_a, col_b, col_c = st.columns(3)
+        col_a.download_button("SVG (Adobe)", svg_bytes, f"{filename_stem}.svg", "image/svg+xml")
+        col_b.download_button("PNG (High Res)", png_bytes, f"{filename_stem}.png", "image/png")
+        col_c.download_button(
+            "CSV (Data)",
+            csv_bytes,
+            f"{filename_stem}.csv",
+            "text/csv",
+            help="Side-by-side rankings: the left columns are the FULL ranking "
+                 "(no chart exclusions); the right columns match the CHART (drops "
+                 "anything in 'Exclude from chart', keeps every other item)."
+        )
+
+        if unknown_count > 0:
+            st.caption(
+                f"CSV includes an 'Unknown' row for {unknown_count:,} "
+                f"row{'s' if unknown_count != 1 else ''} with no value in this column."
+            )
+        if chart_exclusion_count > 0:
+            st.caption(
+                f"Chart half of CSV omits {chart_exclusion_count} "
+                f"item{'s' if chart_exclusion_count != 1 else ''} from the "
+                f"'Exclude from chart' list; Full half keeps them."
+            )
+
+
+# Wrap with @st.fragment when available (Streamlit ≥ 1.37). On older versions,
+# falls through to a regular function call (full rerun on every interaction).
+if hasattr(st, "fragment"):
+    render_view_chart = st.fragment(_render_view_chart_body)
+else:
+    render_view_chart = _render_view_chart_body
+
+
 # ========================= APP START =========================
 st.markdown(f'<h1 style="color:{APP_TITLE_COLOR};">Ranklin</h1>', unsafe_allow_html=True)
 
@@ -1888,106 +2015,37 @@ if uploaded_file:
     # --- CHART OPTIONS ---
     metric_series = metric_series.sort_values(ascending=False)
 
-    with st.sidebar:
-        st.markdown("---")
-        st.header("4. View Options")
-        exclude = st.multiselect("Exclude from chart:", metric_series.index.tolist())
-        final_series = metric_series.drop(exclude, errors='ignore')
-        top_n = st.number_input("Number of bars", 1, max(1, len(final_series)), min(10, max(1, len(final_series))))
-        rank_mode = st.radio("Order:", ["Highest first", "Lowest first"], horizontal=True)
-
-    l_chart = final_series.index.tolist()
-    v_chart = final_series.values.tolist()
-    if rank_mode == "Lowest first":
-        l_chart, v_chart = l_chart[::-1][:top_n], v_chart[::-1][:top_n]
-    else:
-        l_chart, v_chart = l_chart[:top_n], v_chart[:top_n]
-
-    # --- MAIN DISPLAY ---
-    st.subheader(f"Analysis Results ({len(df_active):,} rows)")
-    if not l_chart:
-        st.warning("No data found.")
-    else:
-        is_money = (mode == "Yes" and ranking_by != "Count") or (mode == "No" and analysis_type == "Sum")
-        # Render once per unique input combo, reuse the bytes on cache hits.
-        # On a typical rerun (you typed in a text input, clicked elsewhere)
-        # this skips the matplotlib draw entirely - a measurable UX win.
-        png_bytes, svg_bytes = render_chart_bytes(
-            tuple(str(x) for x in l_chart),
-            tuple(float(v) for v in v_chart),
-            chart_title,
-            (rank_mode == "Highest first"),
-            "money" if is_money else "count",
+    # Precompute the labels and unknown count BEFORE the fragment - these depend
+    # only on df_active + mode (which don't change with chart exclusion widgets),
+    # so they shouldn't re-run on every fragment rerun.
+    if mode == "Yes":
+        item_label = "Industry / Buzzword"
+        value_label = (
+            amount_choice if (ranking_by != "Count" and amount_choice) else "Number of companies"
         )
-        # use_container_width=True keeps the chart filling the main area,
-        # similar to st.pyplot's default behaviour.
-        st.image(png_bytes, use_container_width=True)
+        unknown_count = count_unknown_rows(df_active, mode="Yes", layout=layout)
+    else:
+        item_label = target_col
+        if analysis_type == "Sum":
+            value_label = f"Sum of {sum_col}"
+        else:
+            value_label = "Number of companies"
+        unknown_count = count_unknown_rows(df_active, mode="No", target_col=target_col)
 
-        with st.sidebar:
-            st.markdown("---")
-            st.header("5. Download")
+    is_money = (mode == "Yes" and ranking_by != "Count") or (mode == "No" and analysis_type == "Sum")
 
-            # Build the full data table (all ranks, plus Unknown row)
-            if mode == "Yes":
-                item_label = "Industry / Buzzword"
-                value_label = (
-                    amount_choice if (ranking_by != "Count" and amount_choice) else "Number of companies"
-                )
-                unknown_count = count_unknown_rows(df_active, mode="Yes", layout=layout)
-            else:
-                item_label = target_col
-                if analysis_type == "Sum":
-                    value_label = f"Sum of {sum_col}"
-                else:
-                    value_label = "Number of companies"
-                unknown_count = count_unknown_rows(df_active, mode="No", target_col=target_col)
-
-            # Single CSV with two side-by-side rankings:
-            #  - Left half (Full):  every item, no chart exclusions
-            #  - Right half (Chart): drops items in 'Exclude from chart', but
-            #    still extends to every remaining item, not just the top N bars
-            combined_df = build_combined_csv_table(
-                metric_series, final_series, unknown_count, item_label, value_label
-            )
-            csv_bytes = combined_df.to_csv(index=False).encode("utf-8")
-            chart_exclusion_count = len(metric_series) - len(final_series)
-
-            # Custom filename, defaulting to the chart title. The default updates
-            # automatically whenever the chart title changes, unless the user
-            # has typed their own filename - we track that via session state.
-            default_stem = safe_filename(chart_title)
-            if st.session_state.get("_filename_last_default") != default_stem:
-                st.session_state["_filename_stem"] = default_stem
-                st.session_state["_filename_last_default"] = default_stem
-            filename_stem = st.text_input(
-                "Filename (no extension)",
-                value=st.session_state.get("_filename_stem", default_stem),
-                key="filename_stem_input",
-                help="Used for all downloads below. Defaults to the chart title."
-            )
-            filename_stem = safe_filename(filename_stem, default=default_stem)
-            st.session_state["_filename_stem"] = filename_stem
-
-            col_a, col_b, col_c = st.columns(3)
-            # Downloads reuse the cached bytes - no second savefig pass.
-            col_a.download_button("SVG (Adobe)", svg_bytes, f"{filename_stem}.svg", "image/svg+xml")
-            col_b.download_button("PNG (High Res)", png_bytes, f"{filename_stem}.png", "image/png")
-            col_c.download_button(
-                "CSV (Data)",
-                csv_bytes,
-                f"{filename_stem}.csv",
-                "text/csv",
-                help="Side-by-side rankings: the left columns are the FULL ranking "
-                     "(no chart exclusions); the right columns match the CHART (drops "
-                     "anything in 'Exclude from chart', keeps every other item)."
-            )
-
-            if unknown_count > 0:
-                st.caption(f"CSV includes an 'Unknown' row for {unknown_count:,} row{'s' if unknown_count != 1 else ''} with no value in this column.")
-            if chart_exclusion_count > 0:
-                st.caption(
-                    f"Chart half of CSV omits {chart_exclusion_count} item{'s' if chart_exclusion_count != 1 else ''} "
-                    f"from the 'Exclude from chart' list; Full half keeps them."
-                )
+    # The fragment handles Section 4 (View Options), the chart render, and
+    # Section 5 (Downloads). Widget interactions inside (exclude, top_n,
+    # rank_mode, filename) only re-render this block - not the filter editor
+    # or the upstream metric computation.
+    render_view_chart(
+        metric_series,
+        len(df_active),
+        item_label,
+        value_label,
+        unknown_count,
+        chart_title,
+        is_money,
+    )
 else:
     st.info("Please upload a file to begin.")
