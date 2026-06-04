@@ -1190,6 +1190,26 @@ with st.sidebar:
 if uploaded_file:
     df = load_data(uploaded_file, sheet_name)
 
+    # Fingerprint of the current data source (file + sheet). Used everywhere
+    # downstream as a cache key for per-data-source memoisation. Computed
+    # here, immediately after load, so it's available to the filter UI and
+    # the column-type metadata cache.
+    current_source = (getattr(uploaded_file, "name", None), sheet_name)
+    source_changed = st.session_state.get("data_source") != current_source
+    if source_changed:
+        # Drop any filter rules pointing at columns that don't exist on the
+        # new sheet, otherwise the next Apply click will crash.
+        current_cols = set(df.columns.astype(str))
+        st.session_state.rules = [
+            r for r in st.session_state.get("rules", [])
+            if r.get("col") in current_cols
+        ]
+        # Drop the column-type metadata cache - stale entries would point at
+        # the previous sheet's data and produce wrong filter-type detection.
+        for k in [k for k in st.session_state if isinstance(k, tuple) and k and k[0] == "_colmeta"]:
+            del st.session_state[k]
+        st.session_state.data_source = current_source
+
     with st.sidebar:
         st.markdown("---")
         chart_title = st.text_input("Chart Title:", "Ranking Chart")
@@ -1523,26 +1543,6 @@ if uploaded_file:
         st.markdown('<div class="apply-btn">', unsafe_allow_html=True)
         apply_trigger = st.button("🚀 APPLY CHANGES", use_container_width=True)
         st.markdown('</div>', unsafe_allow_html=True)
-
-    # Track which (file, sheet) the cached df_active belongs to. When this
-    # changes - e.g. the user switches sheets in a multi-sheet workbook - we
-    # need to rebuild df_active or every column dropdown ends up showing the
-    # previous sheet's columns.
-    current_source = (getattr(uploaded_file, "name", None), sheet_name)
-    source_changed = st.session_state.get("data_source") != current_source
-    if source_changed:
-        # Drop any filter rules pointing at columns that don't exist on the
-        # new sheet, otherwise the next Apply click will crash.
-        current_cols = set(df.columns.astype(str))
-        st.session_state.rules = [
-            r for r in st.session_state.get("rules", [])
-            if r.get("col") in current_cols
-        ]
-        # Drop the column-type metadata cache - stale entries would point at
-        # the previous sheet's data and produce wrong filter-type detection.
-        for k in [k for k in st.session_state if isinstance(k, tuple) and k and k[0] == "_colmeta"]:
-            del st.session_state[k]
-        st.session_state.data_source = current_source
 
     # Filtering Execution
     if apply_trigger or source_changed or 'df_active' not in st.session_state:
