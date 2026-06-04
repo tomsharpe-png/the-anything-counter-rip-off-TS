@@ -695,6 +695,33 @@ def plot_bar(labels, values, title, highlight_first=True, right_formatter=lambda
     return fig
 
 
+@st.cache_data(show_spinner=False, max_entries=10)
+def render_chart_bytes(labels_tuple, values_tuple, title, highlight_first, fmt_kind):
+    """Render the chart once per unique input combination, return PNG + SVG bytes.
+
+    Streamlit reruns the script on every interaction. Without caching, matplotlib
+    redraws the chart on EVERY rerun even when nothing about the chart changed
+    (e.g. while you're typing in another text input). Caching the rendered bytes
+    gives the chart cost-of-display = a memcpy on cache hits, instead of a
+    figure draw.
+
+    Returns (png_bytes, svg_bytes). Both are pre-rendered so the download buttons
+    can reuse them without doing a second savefig pass.
+
+    Tuples are used for the labels/values arguments so the cache key is hashable.
+    """
+    labels = list(labels_tuple)
+    values = list(values_tuple)
+    fmt_fn = money_fmt if fmt_kind == "money" else (lambda x: f"{int(x):,}")
+    fig = plot_bar(labels, values, title, highlight_first=highlight_first, right_formatter=fmt_fn)
+    png = io.BytesIO()
+    fig.savefig(png, format="png", bbox_inches="tight", dpi=300)
+    svg = io.BytesIO()
+    fig.savefig(svg, format="svg", bbox_inches="tight", transparent=True)
+    plt.close(fig)
+    return png.getvalue(), svg.getvalue()
+
+
 def detect_layout(df):
     """Detect Industries/Buzzwords columns.
 
@@ -769,15 +796,53 @@ def detect_layout(df):
 # still on the register and operating normally.
 _ACTIVE_STATUSES = {"active", "dormant company"}
 
+# Beauhurst column names that hold Companies House / trading status. The
+# canonical export uses "Companies House status", but variants exist depending
+# on the export profile - hence the broader set.
+_STATUS_COLUMN_HINTS = (
+    "companies house status",
+    "ch status",
+    "trading status",
+    "company status",
+)
+
 
 def find_companies_house_status_columns(cols):
-    """Return columns that look like a Companies House status field.
+    """Return columns that look like a Companies House / trading status field.
 
-    Beauhurst exports the current status as 'Companies House status' (sometimes
-    prefixed '(Company)') and the historical status as 'Companies House status
-    at time of deal'. We catch both, plus parenthesised owner variants.
+    Matches a few common Beauhurst column name variants (current status, status
+    at time of deal, with or without owner prefix). When the export uses a
+    non-standard column name, the UI still lets the user pick one manually
+    from the full column list.
     """
-    return [c for c in cols if "companies house status" in str(c).lower()]
+    out = []
+    for c in cols:
+        lc = str(c).lower()
+        if any(h in lc for h in _STATUS_COLUMN_HINTS):
+            out.append(c)
+    return out
+
+
+def looks_like_status_values(series, threshold=0.5):
+    """Heuristic: does this column's values look like CH status values?
+
+    Used as a fallback when name-based detection misses. A column is treated
+    as a status field if at least half of its non-null values are in the known
+    Companies House status vocabulary.
+    """
+    known = {
+        "active", "dormant company", "liquidation", "dissolved",
+        "in administration", "in receivership", "voluntary arrangement",
+        "active - proposal to strike off",
+    }
+    non_null = series.dropna()
+    if len(non_null) == 0:
+        return False
+    if pd.api.types.is_numeric_dtype(series) or pd.api.types.is_datetime64_any_dtype(series):
+        return False
+    sample = non_null.head(500)
+    lower = sample.astype(str).str.strip().str.lower()
+    return (lower.isin(known).mean()) >= threshold
 
 
 def rank_amount_columns(cols):
@@ -1269,35 +1334,58 @@ if uploaded_file:
         if 'rules' not in st.session_state:
             st.session_state.rules = []
 
-        # One-click Active filter. Detects any 'Companies House status' column
-        # (current or at-time-of-deal, with or without owner prefix) and lets
-        # the user include only rows where the company is Active or Dormant.
-        status_cols = find_companies_house_status_columns(df.columns)
+        # One-click Active filter. Auto-detects 'Companies House status'
+        # columns; if none found, the user can manually point at any column.
+        # This means the filter is always available regardless of export
+        # column naming.
+        status_cols_auto = find_companies_house_status_columns(df.columns)
+        # Value-based fallback for columns that don't follow naming convention
+        if not status_cols_auto:
+            status_cols_auto = [c for c in df.columns if looks_like_status_values(df[c])]
+
+        active_only = st.checkbox(
+            "Active companies only",
+            value=False,
+            key="filter_active_only",
+            help="Include only rows where Companies House status is 'Active' "
+                 "or 'Dormant Company'. Auto-detects the status column; if not "
+                 "found, you can pick one manually below. Combined with your "
+                 "other filters using AND."
+        )
         chosen_status_col = None
-        if status_cols:
-            chosen_status_col = status_cols[0]
-            # Default off so existing workflows don't change behaviour silently.
-            active_only = st.checkbox(
-                "Active companies only",
-                value=False,
-                key="filter_active_only",
-                help="Include only rows where Companies House status is "
-                     "'Active' or 'Dormant Company'. Detects any 'Companies House "
-                     "status' column (current or at time of deal). Combined with "
-                     "your other filters using AND."
+        if active_only:
+            # Build the options list. Put auto-detected columns at the top,
+            # then everything else - so the user can always override.
+            other_cols = [c for c in df.columns if c not in status_cols_auto]
+            options = ["<None>"] + list(status_cols_auto) + list(other_cols)
+            default_idx = 1 if status_cols_auto else 0
+            chosen_status_col = st.selectbox(
+                "Status column",
+                options,
+                index=default_idx,
+                key="filter_active_status_col",
+                help="Auto-detected columns are listed first. Pick a different "
+                     "one if your export uses a non-standard name."
             )
-            if active_only:
-                if len(status_cols) == 1:
-                    st.caption(f"Using `{status_cols[0]}` as the status column.")
-                else:
-                    chosen_status_col = st.selectbox(
-                        "Status column",
-                        status_cols,
-                        key="filter_active_status_col",
-                        help="Multiple Companies House status columns found - pick which one to filter on."
+            if chosen_status_col == "<None>":
+                chosen_status_col = None
+            elif chosen_status_col in df.columns:
+                # Show how many rows would survive so the user can sanity-check
+                vals_lower = df[chosen_status_col].astype(str).str.strip().str.lower()
+                n_active = int(vals_lower.isin(_ACTIVE_STATUSES).sum())
+                if n_active == 0:
+                    distinct = df[chosen_status_col].dropna().astype(str).str.strip().unique().tolist()[:5]
+                    st.warning(
+                        f"No rows in `{chosen_status_col}` have a value of "
+                        f"'Active' or 'Dormant Company'. Sample values: "
+                        f"{', '.join(repr(v) for v in distinct)}. "
+                        f"This filter will exclude every row when applied."
                     )
-        else:
-            active_only = False
+                else:
+                    st.caption(
+                        f"Of {len(df):,} rows, {n_active:,} have status "
+                        f"'Active' or 'Dormant Company'."
+                    )
 
         c1, c2 = st.columns(2)
         if c1.button("➕ Add filter"):
@@ -1806,9 +1894,19 @@ if uploaded_file:
         st.warning("No data found.")
     else:
         is_money = (mode == "Yes" and ranking_by != "Count") or (mode == "No" and analysis_type == "Sum")
-        fmt = money_fmt if is_money else lambda x: f"{int(x):,}"
-        fig = plot_bar(l_chart, v_chart, chart_title, highlight_first=(rank_mode == "Highest first"), right_formatter=fmt)
-        st.pyplot(fig)
+        # Render once per unique input combo, reuse the bytes on cache hits.
+        # On a typical rerun (you typed in a text input, clicked elsewhere)
+        # this skips the matplotlib draw entirely - a measurable UX win.
+        png_bytes, svg_bytes = render_chart_bytes(
+            tuple(str(x) for x in l_chart),
+            tuple(float(v) for v in v_chart),
+            chart_title,
+            (rank_mode == "Highest first"),
+            "money" if is_money else "count",
+        )
+        # use_container_width=True keeps the chart filling the main area,
+        # similar to st.pyplot's default behaviour.
+        st.image(png_bytes, use_container_width=True)
 
         with st.sidebar:
             st.markdown("---")
@@ -1856,10 +1954,9 @@ if uploaded_file:
             st.session_state["_filename_stem"] = filename_stem
 
             col_a, col_b, col_c = st.columns(3)
-            svg_b = io.BytesIO(); fig.savefig(svg_b, format="svg", bbox_inches="tight", transparent=True)
-            col_a.download_button("SVG (Adobe)", svg_b.getvalue(), f"{filename_stem}.svg", "image/svg+xml")
-            png_b = io.BytesIO(); fig.savefig(png_b, format="png", bbox_inches="tight", dpi=300)
-            col_b.download_button("PNG (High Res)", png_b.getvalue(), f"{filename_stem}.png", "image/png")
+            # Downloads reuse the cached bytes - no second savefig pass.
+            col_a.download_button("SVG (Adobe)", svg_bytes, f"{filename_stem}.svg", "image/svg+xml")
+            col_b.download_button("PNG (High Res)", png_bytes, f"{filename_stem}.png", "image/png")
             col_c.download_button(
                 "CSV (Data)",
                 csv_bytes,
