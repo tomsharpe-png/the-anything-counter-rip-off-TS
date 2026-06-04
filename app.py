@@ -1977,27 +1977,20 @@ if uploaded_file:
                  "respect this list; the 'Full' columns ignore it."
         )
         final_series = metric_series.drop(exclude, errors='ignore')
-        # Top-N slider. Default is 10 (or the full length if there are fewer
-        # than 10 items). Slider beats number_input for "easy to change" -
-        # drag, no clicking the +/- arrows. The widget state is reset when
-        # the data source changes (see the source_changed branch above) so a
-        # fresh file always starts at 10.
+        # Top-N number input - you can type a value or use the +/- arrows.
+        # Default is 10 (or the full length if there are fewer items). Widget
+        # state is reset on source change (see the source_changed handler) so
+        # a fresh file always starts at 10.
         _series_len = max(1, len(final_series))
-        _slider_max = max(2, min(_series_len, 50))  # cap at 50; slider needs min<max
-        if _series_len == 1:
-            # Edge case: only one item, slider would be degenerate. Just show count.
-            top_n = 1
-            st.caption("Showing the single ranked item.")
-        else:
-            top_n = st.slider(
-                "Number of bars",
-                min_value=1,
-                max_value=_slider_max,
-                value=min(10, _slider_max),
-                step=1,
-                key="view_top_n",
-                help="Drag to change. Caps at 50 - if you need more, export the CSV."
-            )
+        top_n = st.number_input(
+            "Number of bars",
+            min_value=1,
+            max_value=_series_len,
+            value=min(10, _series_len),
+            step=1,
+            key="view_top_n",
+            help="Type a number or use the arrows.",
+        )
         rank_mode = st.radio(
             "Order:", ["Highest first", "Lowest first"],
             horizontal=True, key="view_rank_mode",
