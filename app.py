@@ -15,7 +15,7 @@ mpl.rcParams['font.sans-serif'] = ['Arial', 'Helvetica', 'DejaVu Sans', 'sans-se
 
 APP_TITLE_COLOR = '#000000'
 
-st.set_page_config(page_title="Ranklin rip off", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Ranklin", layout="wide", initial_sidebar_state="expanded")
 
 # Custom CSS
 st.markdown("""
@@ -379,6 +379,10 @@ _CANONICAL_SORTED = sorted(_CANONICAL_TAGS, key=len, reverse=True)
 # Keep a lower-cased set for fast "is this a canonical Beauhurst tag?" checks.
 _CANONICAL_LOWER = {t.lower() for t in _CANONICAL_TAGS}
 
+# Map lowercase tag -> canonical-case form. Lets the fast path normalise case
+# in O(1) per piece instead of scanning the full sorted list.
+_CANONICAL_CASE_MAP = {t.lower(): t for t in _CANONICAL_TAGS}
+
 # Backwards-compatible alias - older code expects MULTI_COMMA_INDUSTRIES.
 MULTI_COMMA_INDUSTRIES = [t for t in BEAUHURST_INDUSTRIES if "," in t]
 _MULTI_COMMA_SORTED = _CANONICAL_SORTED  # kept for backwards compatibility
@@ -413,32 +417,36 @@ def smart_split_industries(value, canonical_sorted=_CANONICAL_SORTED):
       1. If the value contains a semicolon, split on semicolons (commas inside
          names are kept literal - this is the whole reason semicolon-separated
          exports exist).
-      2. Otherwise, scan the string left-to-right looking for the LONGEST
-         canonical Beauhurst tag that matches at the current position. Match
-         is case-insensitive; canonical case is preserved in the output.
-      3. If no canonical match starts here, fall back to splitting on the next
-         comma. This keeps the splitter tolerant: a new Beauhurst tag we don't
-         know about yet still comes through, it just doesn't get case-normalised.
+      2. Fast path: naive comma split. If every piece is a known canonical tag,
+         return them in canonical case. ~95% of rows take this path.
+      3. Slow path (only when at least one piece isn't canonical): scan the
+         string left-to-right looking for the LONGEST canonical Beauhurst tag
+         that matches at the current position. This is the only way to keep
+         multi-comma names ("Repair, maintenance and servicing") intact.
 
-    The canonical list includes ALL 236 industries and 74 buzzwords from the
-    Beauhurst Industries & Buzzwords database, not only multi-comma names. This
-    means correctness across the board: every known Beauhurst tag is matched
-    atomically, even ones we haven't seen cause problems before.
-
-    Examples:
-        "Repair, maintenance and servicing, Manufacturing"
-            -> ["Repair, maintenance and servicing", "Manufacturing"]
-        "repair, maintenance and servicing, MANUFACTURING"
-            -> ["Repair, maintenance and servicing", "Manufacturing"]
-        "Repair, maintenance and servicing; Manufacturing; FinTech"
-            -> ["Repair, maintenance and servicing", "Manufacturing", "FinTech"]
+    Results are memoised per unique cell value via a module-level cache, so a
+    column with many duplicate values only pays the cost once per distinct value.
     """
     if value is None or (isinstance(value, float) and np.isnan(value)):
         return []
     s = str(value).strip()
     if not s or s.lower() in ("nan", "none"):
         return []
+    # Memo cache: return a COPY so callers can mutate without polluting the cache
+    cached = _SPLIT_CACHE.get(s)
+    if cached is not None:
+        return list(cached)
+    result = _smart_split_uncached(s, canonical_sorted)
+    # Bound the cache so repeated runs with very heterogeneous data don't grow
+    # memory without bound. 20k unique tag-strings covers a multi-million-row
+    # export comfortably.
+    if len(_SPLIT_CACHE) < 20000:
+        _SPLIT_CACHE[s] = tuple(result)
+    return result
 
+
+def _smart_split_uncached(s, canonical_sorted):
+    """The actual splitting logic, called once per unique string."""
     # Semicolon-separated: unambiguous separator. Still normalise items to
     # canonical Beauhurst case where we can.
     if ";" in s:
@@ -446,17 +454,20 @@ def smart_split_industries(value, canonical_sorted=_CANONICAL_SORTED):
         for x in (p.strip() for p in s.split(";")):
             if not x or x.lower() in ("nan", "none"):
                 continue
-            if x.lower() in _CANONICAL_LOWER:
-                # Match canonical form (preserves case the user expects)
-                for canon in canonical_sorted:
-                    if canon.lower() == x.lower():
-                        out.append(canon)
-                        break
-            else:
-                out.append(x)
+            canon = _CANONICAL_CASE_MAP.get(x.lower())
+            out.append(canon if canon else x)
         return out
 
-    # Comma-separated: longest-match scan against canonical multi-comma names
+    # FAST PATH: naive comma split. If every piece is a canonical Beauhurst
+    # tag, we're done in O(N) - no need to do the longest-match scan.
+    raw_pieces = [p.strip() for p in s.split(",")]
+    cleaned = [p for p in raw_pieces if p and p.lower() not in ("nan", "none")]
+    if cleaned and all(p.lower() in _CANONICAL_CASE_MAP for p in cleaned):
+        return [_CANONICAL_CASE_MAP[p.lower()] for p in cleaned]
+
+    # SLOW PATH: at least one piece is not canonical. This could be either an
+    # unknown tag OR a fragment of a multi-comma industry name like
+    # "Repair, maintenance and servicing". Do the longest-match scan.
     items = []
     pos = 0
     n = len(s)
@@ -467,7 +478,7 @@ def smart_split_industries(value, canonical_sorted=_CANONICAL_SORTED):
         if pos >= n:
             break
 
-        # Try to match a known multi-comma industry at this position
+        # Try to match a known canonical tag at this position
         matched_name = None
         for name in canonical_sorted:
             end = pos + len(name)
@@ -491,6 +502,11 @@ def smart_split_industries(value, canonical_sorted=_CANONICAL_SORTED):
                 pos = next_comma + 1
 
     return [x for x in items if x and x.lower() not in ("nan", "none")]
+
+
+# Module-level memo cache for smart_split_industries. Keyed by raw cell string,
+# values are tuples (immutable so the cache can't be corrupted).
+_SPLIT_CACHE = {}
 
 
 # ========================= CACHED ENGINES =========================
@@ -746,6 +762,22 @@ def detect_layout(df):
     if ind_s or buzz_s:
         return {"mode": "single", "ind_col": ind_s, "buzz_col": buzz_s}
     return {"mode": "unknown"}
+
+
+# Companies House status values that count as "Active" for our purposes. The
+# user definition is "Active or Dormant Company" - both mean the company is
+# still on the register and operating normally.
+_ACTIVE_STATUSES = {"active", "dormant company"}
+
+
+def find_companies_house_status_columns(cols):
+    """Return columns that look like a Companies House status field.
+
+    Beauhurst exports the current status as 'Companies House status' (sometimes
+    prefixed '(Company)') and the historical status as 'Companies House status
+    at time of deal'. We catch both, plus parenthesised owner variants.
+    """
+    return [c for c in cols if "companies house status" in str(c).lower()]
 
 
 def rank_amount_columns(cols):
@@ -1145,7 +1177,7 @@ def build_combined_csv_table(metric_series, final_series, unknown_count, item_la
 
 
 # ========================= APP START =========================
-st.markdown(f'<h1 style="color:{APP_TITLE_COLOR};">Ranklin rip off</h1>', unsafe_allow_html=True)
+st.markdown(f'<h1 style="color:{APP_TITLE_COLOR};">Ranklin</h1>', unsafe_allow_html=True)
 
 with st.sidebar:
     st.header("1. Data Source")
@@ -1216,6 +1248,37 @@ if uploaded_file:
         st.header("3. Raw Data Filters")
         if 'rules' not in st.session_state:
             st.session_state.rules = []
+
+        # One-click Active filter. Detects any 'Companies House status' column
+        # (current or at-time-of-deal, with or without owner prefix) and lets
+        # the user include only rows where the company is Active or Dormant.
+        status_cols = find_companies_house_status_columns(df.columns)
+        chosen_status_col = None
+        if status_cols:
+            chosen_status_col = status_cols[0]
+            # Default off so existing workflows don't change behaviour silently.
+            active_only = st.checkbox(
+                "Active companies only",
+                value=False,
+                key="filter_active_only",
+                help="Include only rows where Companies House status is "
+                     "'Active' or 'Dormant Company'. Detects any 'Companies House "
+                     "status' column (current or at time of deal). Combined with "
+                     "your other filters using AND."
+            )
+            if active_only:
+                if len(status_cols) == 1:
+                    st.caption(f"Using `{status_cols[0]}` as the status column.")
+                else:
+                    chosen_status_col = st.selectbox(
+                        "Status column",
+                        status_cols,
+                        key="filter_active_status_col",
+                        help="Multiple Companies House status columns found - pick which one to filter on."
+                    )
+        else:
+            active_only = False
+
         c1, c2 = st.columns(2)
         if c1.button("➕ Add filter"):
             st.session_state.rules.append({
@@ -1245,9 +1308,19 @@ if uploaded_file:
                 rule['col'] = chosen_col
 
                 series = df[chosen_col]
-                is_year = is_year_column(chosen_col, series)
-                is_date = is_date_like(series) and not is_year
-                is_num = is_numeric_column(series) and not is_year and not is_date
+                # Column-type detection (is_year / is_date / is_num) used to run
+                # on every rerun for every filter rule - ~20ms per column with
+                # date parsing, ~60ms total for 3 filter rules. Cache the result
+                # in session state keyed by (data source, column name); the
+                # source-change handler clears these when the user switches
+                # sheets or re-uploads, so we never serve stale metadata.
+                _meta_key = ("_colmeta", current_source, chosen_col)
+                if _meta_key not in st.session_state:
+                    is_year_v = is_year_column(chosen_col, series)
+                    is_date_v = is_date_like(series) and not is_year_v
+                    is_num_v = is_numeric_column(series) and not is_year_v and not is_date_v
+                    st.session_state[_meta_key] = (is_year_v, is_date_v, is_num_v)
+                is_year, is_date, is_num = st.session_state[_meta_key]
 
                 # Filter "kind" - pick specific values or apply a range/comparison
                 # rule. Range/comparison works for numbers, years, and dates -
@@ -1465,11 +1538,20 @@ if uploaded_file:
             r for r in st.session_state.get("rules", [])
             if r.get("col") in current_cols
         ]
+        # Drop the column-type metadata cache - stale entries would point at
+        # the previous sheet's data and produce wrong filter-type detection.
+        for k in [k for k in st.session_state if isinstance(k, tuple) and k and k[0] == "_colmeta"]:
+            del st.session_state[k]
         st.session_state.data_source = current_source
 
     # Filtering Execution
     if apply_trigger or source_changed or 'df_active' not in st.session_state:
         df_active = df.copy()
+        # One-click Active filter (applied before the manual rule list so
+        # subsequent rules operate on the already-narrowed view).
+        if active_only and chosen_status_col and chosen_status_col in df_active.columns:
+            status_lower = df_active[chosen_status_col].astype(str).str.strip().str.lower()
+            df_active = df_active[status_lower.isin(_ACTIVE_STATUSES)]
         for rule in st.session_state.rules:
             col = rule.get('col')
             if col not in df_active.columns:
