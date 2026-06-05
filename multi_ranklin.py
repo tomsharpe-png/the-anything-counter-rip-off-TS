@@ -1280,10 +1280,21 @@ def build_combined_csv_table(metric_series, final_series, unknown_count, item_la
 # per group. Same metric pipeline as the single case, just looped.
 # ========================================================================
 
-# Hard cap on number of facet groups. Picking a high-cardinality column
-# (Company name, Postcode etc.) would otherwise produce thousands of charts
-# and lock up the browser; this surfaces the issue as a friendly warning.
-MAX_FACET_GROUPS = 30
+# Hard cap on number of facet groups computed. Guards against runaway
+# memory/time if a high-cardinality column (Company name, Postcode etc.)
+# gets picked as a facet by accident. Set high enough that real-world
+# combinations (country × age bracket × sector, etc.) won't hit it.
+MAX_FACET_GROUPS_HARD = 500
+
+# Display cap: how many charts are rendered to the page. Excel export
+# still includes ALL combinations up to MAX_FACET_GROUPS_HARD, gated by a
+# confirmation prompt above 30. The display cap exists purely to keep the
+# page responsive - rendering 500 200-DPI PNGs would take ~100 seconds.
+MAX_FACET_DISPLAY = 30
+
+# Above this number of combinations, the Excel download requires explicit
+# confirmation before the workbook is built. Below this, it's one click.
+EXCEL_CONFIRM_THRESHOLD = 30
 
 
 def _compute_metric_for_subset(df_subset, mode, **kwargs):
@@ -1354,7 +1365,7 @@ def build_faceted_csv(facet_results, exclude_set, item_label, value_label):
     to get the side-by-side Full/Chart layout the user is used to.
     """
     rows = []
-    for facet_label, sub_df, metric, unknown_count in facet_results:
+    for _facet_key, facet_label, sub_df, metric, unknown_count in facet_results:
         group_label = facet_label if facet_label is not None else ""
         for rank, (item, val) in enumerate(metric.items(), start=1):
             rows.append({
@@ -1390,7 +1401,7 @@ def build_chart_zip(facet_results, exclude_set, top_n, rank_mode, base_title,
     import zipfile
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for facet_label, sub_df, metric, unknown_count in facet_results:
+        for _facet_key, facet_label, sub_df, metric, unknown_count in facet_results:
             # Slice to chart shape (same logic as the inline display loop)
             chart_series = metric.drop(
                 [k for k in metric.index if k in exclude_set], errors="ignore"
@@ -1418,6 +1429,271 @@ def build_chart_zip(facet_results, exclude_set, top_n, rank_mode, base_title,
 
             stem = safe_filename(facet_label or "all", default="all")
             zf.writestr(f"{stem}.{ext}", content)
+    return buf.getvalue()
+
+
+# ========================================================================
+# MULTI-TAB EXCEL EXPORT — one tab per chosen "tab axis" value, with the
+# remaining facet columns laid out side-by-side within each tab.
+# ========================================================================
+
+def _safe_sheet_name(name):
+    """Excel sheet names: ≤31 chars, no `\\ / ? * [ ] :` characters.
+
+    Replaces forbidden characters with a hyphen and truncates. Empty results
+    fall back to 'Sheet'.
+    """
+    name = str(name) if name is not None else ""
+    for ch in ("\\", "/", "?", "*", "[", "]", ":"):
+        name = name.replace(ch, "-")
+    name = name.strip()[:31]
+    return name or "Sheet"
+
+
+def _summarise_excel_layout(facet_results, facet_cols, tab_axis_col):
+    """Return a dict summarising the Excel structure for the live preview.
+
+    Doesn't actually build the workbook - just inspects the facet_results to
+    report tab names, side-by-side block labels per tab, and totals. Cheap
+    to call on every rerun so the preview updates as the user toggles options.
+
+    Output keys:
+      tabs:         list of tab names (strings, one per Excel sheet)
+      blocks_by_tab: dict mapping tab name → list of side-by-side block labels
+      n_tabs:       int
+      n_blocks:     int (total rankings across all tabs)
+      side_cols:    list of facet column names used as side-by-side axes
+    """
+    if not facet_cols:
+        # No facets - degenerate "one tab, one block" case
+        return {"tabs": ["All"], "blocks_by_tab": {"All": ["All"]},
+                "n_tabs": 1, "n_blocks": 1, "side_cols": []}
+
+    # No tab axis = one tab with everything side-by-side
+    if not tab_axis_col or tab_axis_col == "(All in one tab)":
+        labels = [entry[1] or "All" for entry in facet_results]
+        return {"tabs": ["All"], "blocks_by_tab": {"All": labels},
+                "n_tabs": 1, "n_blocks": len(labels), "side_cols": facet_cols}
+
+    tab_axis_idx = facet_cols.index(tab_axis_col)
+    side_cols = [c for c in facet_cols if c != tab_axis_col]
+
+    tabs_in_order = []
+    blocks_by_tab = {}
+    for entry in facet_results:
+        fkey = entry[0]
+        tab_val = fkey[tab_axis_idx]
+        tab_name = "(blank)" if (tab_val is None or
+                                  (isinstance(tab_val, float) and pd.isna(tab_val))) \
+                              else str(tab_val)
+        if tab_name not in blocks_by_tab:
+            blocks_by_tab[tab_name] = []
+            tabs_in_order.append(tab_name)
+        if side_cols:
+            side_vals = [fkey[facet_cols.index(c)] for c in side_cols]
+            block_label = " · ".join(
+                "(blank)" if (v is None or (isinstance(v, float) and pd.isna(v)))
+                else str(v) for v in side_vals
+            )
+        else:
+            block_label = "All"
+        blocks_by_tab[tab_name].append(block_label)
+
+    return {
+        "tabs": tabs_in_order,
+        "blocks_by_tab": blocks_by_tab,
+        "n_tabs": len(tabs_in_order),
+        "n_blocks": sum(len(v) for v in blocks_by_tab.values()),
+        "side_cols": side_cols,
+    }
+
+
+def build_excel_workbook(facet_results, facet_cols, tab_axis_col, item_label,
+                         value_label, exclude_set, workbook_title="Multi Ranklin"):
+    """Build an .xlsx workbook with multiple tabs of side-by-side rankings.
+
+    The user picks one facet column to be the "tab axis" - that produces one
+    Excel sheet per unique value. The remaining facet columns combine into a
+    "side-by-side axis" - each unique combination becomes a 4-column block
+    (Rank, Item, Value, In Chart) within the sheet, separated by a blank
+    spacer column.
+
+    Sheet 1 (always present) is an "Overview" sheet listing every tab and
+    block, so a user opening the file in Excel gets immediate orientation.
+
+    Returns the .xlsx bytes ready to feed to st.download_button.
+    """
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+
+    # ===== Determine sheet groupings =====
+    layout = _summarise_excel_layout(facet_results, facet_cols, tab_axis_col)
+    tabs = layout["tabs"]
+    blocks_by_tab = layout["blocks_by_tab"]
+    side_cols = layout["side_cols"]
+
+    # Map (tab_name, block_label) → metric/unknown so we can pull data per cell
+    cell_data = {}  # {(tab_name, block_label): (metric, unknown)}
+    if not facet_cols:
+        # Single ranking case - just one block on one tab
+        _fkey, _lbl, _sub, metric, unknown = facet_results[0]
+        cell_data[("All", "All")] = (metric, unknown)
+    elif not tab_axis_col or tab_axis_col == "(All in one tab)":
+        for entry in facet_results:
+            label = entry[1] or "All"
+            cell_data[("All", label)] = (entry[3], entry[4])
+    else:
+        tab_axis_idx = facet_cols.index(tab_axis_col)
+        for entry in facet_results:
+            fkey = entry[0]
+            tab_val = fkey[tab_axis_idx]
+            tab_name = "(blank)" if (tab_val is None or
+                                      (isinstance(tab_val, float) and pd.isna(tab_val))) \
+                                  else str(tab_val)
+            if side_cols:
+                side_vals = [fkey[facet_cols.index(c)] for c in side_cols]
+                block_label = " · ".join(
+                    "(blank)" if (v is None or (isinstance(v, float) and pd.isna(v)))
+                    else str(v) for v in side_vals
+                )
+            else:
+                block_label = "All"
+            cell_data[(tab_name, block_label)] = (entry[3], entry[4])
+
+    # ===== Styling constants =====
+    title_font = Font(name="Calibri", size=12, bold=True, color="FFFFFF")
+    title_fill = PatternFill(start_color="4B4897", end_color="4B4897", fill_type="solid")
+    header_font = Font(name="Calibri", size=10, bold=True)
+    header_fill = PatternFill(start_color="E8E6E0", end_color="E8E6E0", fill_type="solid")
+    thin = Side(border_style="thin", color="D0CDC4")
+    cell_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    # ===== Overview sheet =====
+    overview = wb.create_sheet(title="Overview")
+    overview["A1"] = workbook_title
+    overview["A1"].font = Font(name="Calibri", size=16, bold=True, color="1A1A1F")
+    overview["A2"] = f"{layout['n_tabs']} tab(s), {layout['n_blocks']} ranking(s) total"
+    overview["A2"].font = Font(name="Calibri", size=11, italic=True, color="6B6B72")
+    if tab_axis_col:
+        overview["A3"] = f"Tab axis: {tab_axis_col}"
+        overview["A3"].font = Font(name="Calibri", size=10, color="6B6B72")
+    if side_cols:
+        overview["A4"] = f"Side-by-side axis: {', '.join(side_cols)}"
+        overview["A4"].font = Font(name="Calibri", size=10, color="6B6B72")
+
+    overview["A6"] = "Tab"
+    overview["B6"] = "Rankings in this tab"
+    overview["A6"].font = header_font
+    overview["B6"].font = header_font
+    overview["A6"].fill = header_fill
+    overview["B6"].fill = header_fill
+    r = 7
+    for tab in tabs:
+        overview.cell(row=r, column=1, value=tab)
+        overview.cell(row=r, column=2, value=", ".join(blocks_by_tab[tab]))
+        r += 1
+    overview.column_dimensions["A"].width = 28
+    overview.column_dimensions["B"].width = 80
+
+    # ===== Data sheets =====
+    BLOCK_WIDTH = 4  # Rank, Item, Value, In Chart
+    SPACER = 1
+    seen_safe_names = {"Overview"}
+
+    for tab_name in tabs:
+        # Excel sheet names must be unique and meet character constraints
+        safe = _safe_sheet_name(tab_name)
+        suffix = 2
+        while safe in seen_safe_names:
+            base = safe[: 31 - len(f" ({suffix})")]
+            safe = f"{base} ({suffix})"
+            suffix += 1
+        seen_safe_names.add(safe)
+        sheet = wb.create_sheet(title=safe)
+
+        # Title row at the very top: full tab name in case it was truncated
+        sheet.cell(row=1, column=1, value=tab_name).font = Font(
+            name="Calibri", size=14, bold=True, color="1A1A1F"
+        )
+
+        col_start = 1
+        for block_label in blocks_by_tab[tab_name]:
+            metric, unknown = cell_data.get((tab_name, block_label), (None, 0))
+            if metric is None:
+                continue
+
+            # Block header (row 3): block label spanning all 4 cols
+            for offset in range(BLOCK_WIDTH):
+                cell = sheet.cell(row=3, column=col_start + offset)
+                cell.fill = title_fill
+                cell.border = cell_border
+            hdr = sheet.cell(row=3, column=col_start, value=block_label)
+            hdr.font = title_font
+            hdr.alignment = Alignment(horizontal="left", vertical="center")
+            sheet.merge_cells(start_row=3, start_column=col_start,
+                              end_row=3, end_column=col_start + BLOCK_WIDTH - 1)
+
+            # Column headers (row 4)
+            for offset, h in enumerate(["Rank", item_label, value_label, "In Chart"]):
+                cell = sheet.cell(row=4, column=col_start + offset, value=h)
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.border = cell_border
+                cell.alignment = Alignment(horizontal="left", vertical="center")
+
+            # Data rows
+            row = 5
+            for rank, (item, val) in enumerate(metric.items(), start=1):
+                sheet.cell(row=row, column=col_start, value=rank).border = cell_border
+                sheet.cell(row=row, column=col_start + 1, value=str(item)).border = cell_border
+                val_cell = sheet.cell(row=row, column=col_start + 2,
+                                       value=float(val) if pd.notna(val) else None)
+                val_cell.border = cell_border
+                # Format number columns. Decide format based on heuristic: very
+                # small or zero-decimal values format as integers; bigger as
+                # thousands-separated; otherwise use #,##0.00.
+                if pd.notna(val):
+                    if isinstance(val, (int, float)) and float(val).is_integer():
+                        val_cell.number_format = "#,##0"
+                    else:
+                        val_cell.number_format = "#,##0.00"
+                in_chart_cell = sheet.cell(
+                    row=row, column=col_start + 3,
+                    value="No" if item in exclude_set else "Yes"
+                )
+                in_chart_cell.border = cell_border
+                row += 1
+
+            if unknown and unknown > 0:
+                sheet.cell(row=row, column=col_start, value="").border = cell_border
+                sheet.cell(row=row, column=col_start + 1, value="Unknown").border = cell_border
+                u_cell = sheet.cell(row=row, column=col_start + 2, value=int(unknown))
+                u_cell.border = cell_border
+                u_cell.number_format = "#,##0"
+                sheet.cell(row=row, column=col_start + 3, value="—").border = cell_border
+
+            # Column widths within the block
+            sheet.column_dimensions[get_column_letter(col_start)].width = 7      # Rank
+            sheet.column_dimensions[get_column_letter(col_start + 1)].width = 32  # Item
+            sheet.column_dimensions[get_column_letter(col_start + 2)].width = 14  # Value
+            sheet.column_dimensions[get_column_letter(col_start + 3)].width = 10  # In Chart
+            if col_start + BLOCK_WIDTH <= 16384:  # leave the spacer column blank
+                sheet.column_dimensions[get_column_letter(col_start + BLOCK_WIDTH)].width = 2
+
+            col_start += BLOCK_WIDTH + SPACER
+
+        # Freeze the title + header rows
+        sheet.freeze_panes = "A5"
+
+    # Move Overview to the front
+    wb.move_sheet("Overview", offset=-len(wb.sheetnames))
+
+    buf = io.BytesIO()
+    wb.save(buf)
     return buf.getvalue()
 
 
@@ -1832,7 +2108,8 @@ if uploaded_file:
             help="Pick one or more columns (e.g. Continent, Age bracket) to produce "
                  "a separate ranking for each unique combination of values. "
                  "Leave empty for a single overall ranking. Capped at "
-                 f"{MAX_FACET_GROUPS} groups - if you exceed that, narrow the data first.",
+                 f"Capped at {MAX_FACET_GROUPS_HARD} combinations total - if you exceed "
+                 "that, narrow the data first.",
         )
 
         st.markdown("---")
@@ -2126,8 +2403,12 @@ if uploaded_file:
             and "_facet_results" in st.session_state):
         facet_results = st.session_state["_facet_results"]
     else:
-        # Compute fresh. Each entry in facet_results is:
-        #   (facet_label_or_None, sub_df, sorted_metric_series, unknown_count)
+        # Compute fresh. Each entry in facet_results is now a 5-tuple:
+        #   (facet_key_tuple, facet_label_or_None, sub_df, sorted_metric_series, unknown_count)
+        # facet_key_tuple is always a tuple (() for the no-facet case, length
+        # 1+ for faceted) so downstream code can split/recombine the facet
+        # values without re-parsing labels. Compute ALL groups up to a hard
+        # safety limit; the display loop separately caps how many it renders.
         facet_results = []
         n_total_groups = 0
         if facet_cols_valid:
@@ -2138,14 +2419,18 @@ if uploaded_file:
             all_pairs = [(k, sub) for k, sub in grouped]
             n_total_groups = len(all_pairs)
             all_pairs.sort(key=lambda kv: -len(kv[1]))
-            for facet_key, sub in all_pairs[:MAX_FACET_GROUPS]:
+            for facet_key, sub in all_pairs[:MAX_FACET_GROUPS_HARD]:
+                # Normalise to tuple so single-col groupby and multi-col both
+                # produce the same shape downstream
+                if not isinstance(facet_key, tuple):
+                    facet_key = (facet_key,)
                 label = _format_facet_label(facet_key, facet_cols_valid)
                 metric = _compute_metric_for_subset(sub, mode, **metric_kwargs)
                 if mode == "Yes":
                     unknown = count_unknown_rows(sub, mode="Yes", layout=layout)
                 else:
                     unknown = count_unknown_rows(sub, mode="No", target_col=target_col)
-                facet_results.append((label, sub, metric, unknown))
+                facet_results.append((facet_key, label, sub, metric, unknown))
         else:
             # Single, no-facet - same shape as faceted so downstream code is uniform
             metric = _compute_metric_for_subset(df_active, mode, **metric_kwargs)
@@ -2153,19 +2438,26 @@ if uploaded_file:
                 unknown = count_unknown_rows(df_active, mode="Yes", layout=layout)
             else:
                 unknown = count_unknown_rows(df_active, mode="No", target_col=target_col)
-            facet_results = [(None, df_active, metric, unknown)]
+            facet_results = [((), None, df_active, metric, unknown)]
 
         st.session_state["_facet_results"] = facet_results
         st.session_state["_facet_cache_key"] = _facet_cache_key
         st.session_state["_facet_total_groups"] = n_total_groups
 
-    # If facets caused groups to be capped, surface that to the user
+    # If facets caused on-screen display to be capped, surface that.
+    # The full set is still in facet_results - Excel export uses all of them.
     n_total = st.session_state.get("_facet_total_groups", 0)
-    if facet_cols_valid and n_total > MAX_FACET_GROUPS:
+    if facet_cols_valid and n_total > MAX_FACET_DISPLAY:
         st.warning(
-            f"Showing top {MAX_FACET_GROUPS} of {n_total:,} groups by row count. "
-            f"To see all of them, either narrow your group-by selection (pick "
-            f"fewer columns), or apply filters in section 3 to reduce the data."
+            f"Showing the top {MAX_FACET_DISPLAY} of {n_total:,} groups on screen "
+            f"(ordered by row count). The Excel download in section 5 includes all "
+            f"{n_total:,} combinations."
+        )
+    if n_total > MAX_FACET_GROUPS_HARD:
+        st.warning(
+            f"⚠️ Capped at {MAX_FACET_GROUPS_HARD} groups out of {n_total:,} possible — "
+            f"the facet selection is too granular. Either narrow your group-by "
+            f"selection or apply filters in section 3 to reduce the data."
         )
 
     # --- CHART OPTIONS ---
@@ -2175,14 +2467,14 @@ if uploaded_file:
     # tuning would mean N copies of these widgets, which gets unmanageable
     # past a couple of groups.
     all_items_with_total = {}
-    for _, _, metric, _ in facet_results:
+    for _, _, _, metric, _ in facet_results:
         for k, v in metric.items():
             all_items_with_total[k] = all_items_with_total.get(k, 0) + float(v or 0)
     # Order exclude options by total descending - the items most likely to
     # need excluding (because they dominate the chart) appear at the top.
     exclude_options = sorted(all_items_with_total.keys(),
                              key=lambda k: -all_items_with_total[k])
-    max_facet_size = max((len(m) for _, _, m, _ in facet_results), default=1)
+    max_facet_size = max((len(m) for _, _, _, m, _ in facet_results), default=1)
 
     with st.sidebar:
         st.markdown("---")
@@ -2219,7 +2511,7 @@ if uploaded_file:
     fmt_kind = "money" if is_money else "count"
 
     n_charts = sum(
-        1 for _, _, metric, _ in facet_results
+        1 for _, _, _, metric, _ in facet_results
         if len([k for k in metric.index if k not in exclude_set]) > 0
     )
     if facet_cols_valid:
@@ -2231,13 +2523,16 @@ if uploaded_file:
 
     if not facet_results or all(
         len([k for k in metric.index if k not in exclude_set]) == 0
-        for _, _, metric, _ in facet_results
+        for _, _, _, metric, _ in facet_results
     ):
         st.warning("No data found.")
     else:
         # Loop and render one chart per facet group. For the no-facet case,
-        # the loop runs exactly once and behaves identically to before.
-        for idx, (facet_label, sub_df, metric, unknown_count) in enumerate(facet_results):
+        # the loop runs exactly once and behaves identically to before. When
+        # facets are active, only the first MAX_FACET_DISPLAY entries (already
+        # ordered by row count descending) render to the page - the Excel
+        # download in section 5 includes the full set regardless.
+        for idx, (_facet_key, facet_label, sub_df, metric, unknown_count) in enumerate(facet_results[:MAX_FACET_DISPLAY]):
             # Slice to chart shape (respect exclusions, top-N, ranking direction)
             chart_series = metric.drop(
                 [k for k in metric.index if k in exclude_set], errors="ignore"
@@ -2306,57 +2601,145 @@ if uploaded_file:
 
             # Branch downloads by whether we're faceted or not
             if facet_cols_valid:
-                # Faceted: ZIPs of SVGs / PNGs, long-format CSV
-                csv_df = build_faceted_csv(facet_results, exclude_set, item_label, value_label)
-                csv_bytes = csv_df.to_csv(index=False).encode("utf-8")
+                # === Multi-tab Excel export ===
+                # Pick the "tab axis" - one of the facet columns. Remaining
+                # facets become the side-by-side axis within each tab.
+                st.markdown("**Excel layout**")
+                tab_options = ["(All in one tab)"] + list(facet_cols_valid)
+                # Default to the first facet column ("one tab per first facet")
+                # which matches the typical Beauhurst use case (one tab per
+                # country, age brackets side-by-side).
+                default_idx = 1 if len(facet_cols_valid) >= 1 else 0
+                tab_axis_choice = st.selectbox(
+                    "One tab per…",
+                    tab_options,
+                    index=default_idx,
+                    key="excel_tab_axis",
+                    help="Pick which facet column drives the Excel tabs. The "
+                         "remaining facet columns become side-by-side rankings "
+                         "within each tab. '(All in one tab)' puts everything "
+                         "in a single sheet, side-by-side."
+                )
+                tab_axis_for_excel = None if tab_axis_choice == "(All in one tab)" else tab_axis_choice
 
-                # Capture args for lazy zip building
+                # Live preview - cheap, just inspects the existing facet_results
+                layout_summary = _summarise_excel_layout(
+                    facet_results, facet_cols_valid, tab_axis_for_excel
+                )
+                n_tabs = layout_summary["n_tabs"]
+                n_blocks = layout_summary["n_blocks"]
+
+                # Preview block — show first few tabs + first few blocks-per-tab
+                preview_lines = []
+                preview_lines.append(
+                    f"**{n_tabs} tab{'s' if n_tabs != 1 else ''}**, "
+                    f"**{n_blocks} ranking{'s' if n_blocks != 1 else ''}** total"
+                )
+                if layout_summary["side_cols"]:
+                    preview_lines.append(
+                        f"_Side-by-side axis:_ {' · '.join(layout_summary['side_cols'])}"
+                    )
+                # Sample of tabs
+                sample_tabs = layout_summary["tabs"][:5]
+                more_tabs = max(0, n_tabs - len(sample_tabs))
+                preview_lines.append(
+                    "_Tab names:_ " + ", ".join(sample_tabs)
+                    + (f", +{more_tabs} more" if more_tabs else "")
+                )
+                # Sample of blocks for the first tab
+                if sample_tabs and layout_summary["blocks_by_tab"].get(sample_tabs[0]):
+                    first_blocks = layout_summary["blocks_by_tab"][sample_tabs[0]]
+                    sample_blocks = first_blocks[:4]
+                    more_blocks = max(0, len(first_blocks) - len(sample_blocks))
+                    preview_lines.append(
+                        f"_Inside `{sample_tabs[0]}`:_ "
+                        + ", ".join(sample_blocks)
+                        + (f", +{more_blocks} more" if more_blocks else "")
+                    )
+                st.info("  \n".join(preview_lines))
+
+                # Confirmation gate for large outputs
+                workbook_args = (
+                    facet_results, facet_cols_valid, tab_axis_for_excel,
+                    item_label, value_label, exclude_set, chart_title,
+                )
+                # Confirmation is keyed by (combination count, tab axis choice).
+                # Changing either invalidates the confirmation so the user
+                # always re-confirms after meaningfully changing the layout.
+                confirm_key = ("_excel_confirmed", n_blocks, tab_axis_for_excel)
+                excel_ready = (
+                    n_blocks <= EXCEL_CONFIRM_THRESHOLD
+                    or st.session_state.get("_excel_confirm_token") == confirm_key
+                )
+
+                if not excel_ready:
+                    st.warning(
+                        f"⚠️ {n_blocks:,} rankings would be in this Excel file. "
+                        f"That's above the {EXCEL_CONFIRM_THRESHOLD}-ranking comfort "
+                        f"threshold — building it may take a few seconds and the "
+                        f"file will be sizeable."
+                    )
+                    if st.button("✅ Yes, build the Excel file", key="confirm_excel"):
+                        st.session_state["_excel_confirm_token"] = confirm_key
+                        st.rerun()
+
+                # === Three download buttons (same row): Excel, SVG zip, PNG zip ===
                 _zip_args = (
-                    facet_results, exclude_set, top_n, rank_mode,
+                    facet_results[:MAX_FACET_DISPLAY], exclude_set, top_n, rank_mode,
                     chart_title, is_money, fmt_kind,
                 )
 
                 col_a, col_b, col_c = st.columns(3)
-                col_a.download_button(
+                if excel_ready:
+                    col_a.download_button(
+                        "Excel (.xlsx)",
+                        data=lambda a=workbook_args: build_excel_workbook(*a),
+                        file_name=f"{filename_stem}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        help=f"Multi-tab workbook. {n_tabs} tab(s), {n_blocks} ranking(s) "
+                             "side-by-side within each tab. Built on click.",
+                    )
+                else:
+                    # Disabled placeholder until confirmation
+                    col_a.button(
+                        "Excel (.xlsx)",
+                        disabled=True,
+                        help="Confirm above to enable this download.",
+                    )
+                col_b.download_button(
                     "SVGs (.zip)",
                     data=lambda a=_zip_args: build_chart_zip(*a, format_="svg"),
                     file_name=f"{filename_stem}_svgs.zip",
                     mime="application/zip",
-                    help="One SVG per group, bundled into a single ZIP.",
+                    help=f"One SVG per group (capped at the top {MAX_FACET_DISPLAY} "
+                         "displayed on screen), bundled into a ZIP.",
                 )
-                col_b.download_button(
+                col_c.download_button(
                     "PNGs (.zip)",
                     data=lambda a=_zip_args: build_chart_zip(*a, format_="png_hires"),
                     file_name=f"{filename_stem}_pngs.zip",
                     mime="application/zip",
-                    help="One 300 DPI PNG per group, bundled into a single ZIP.",
-                )
-                col_c.download_button(
-                    "CSV (Data)",
-                    csv_bytes,
-                    f"{filename_stem}.csv",
-                    "text/csv",
-                    help="Long format: one row per (group, ranked item). 'In Chart' "
-                         "column flags whether the item passed the Exclude list."
+                    help=f"One 300 DPI PNG per group (capped at the top {MAX_FACET_DISPLAY} "
+                         "displayed on screen), bundled into a ZIP.",
                 )
 
                 # Captions
-                total_unknown = sum(u for _, _, _, u in facet_results)
+                total_unknown = sum(u for _, _, _, _, u in facet_results)
                 if total_unknown > 0:
                     st.caption(
-                        f"CSV includes per-group 'Unknown' rows ({total_unknown:,} "
+                        f"Excel includes per-group 'Unknown' rows ({total_unknown:,} "
                         f"row{'s' if total_unknown != 1 else ''} total without a value)."
                     )
                 if exclude:
                     st.caption(
-                        f"Excluded from charts (kept in CSV with In Chart = No): "
+                        f"Excluded from charts (kept in Excel with In Chart = No): "
                         f"{', '.join(exclude[:3])}"
                         + (f", +{len(exclude) - 3} more" if len(exclude) > 3 else "")
                         + "."
                     )
             else:
                 # Single ranking - original side-by-side CSV layout
-                (facet_label, sub_df, metric_series, unknown_count) = facet_results[0]
+                (_facet_key, facet_label, sub_df, metric_series, unknown_count) = facet_results[0]
                 final_series = metric_series.drop(
                     [k for k in metric_series.index if k in exclude_set], errors="ignore"
                 )
