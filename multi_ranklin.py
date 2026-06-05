@@ -1287,14 +1287,10 @@ def build_combined_csv_table(metric_series, final_series, unknown_count, item_la
 MAX_FACET_GROUPS_HARD = 500
 
 # Display cap: how many charts are rendered to the page. Excel export
-# still includes ALL combinations up to MAX_FACET_GROUPS_HARD, gated by a
-# confirmation prompt above 30. The display cap exists purely to keep the
-# page responsive - rendering 500 200-DPI PNGs would take ~100 seconds.
+# still includes ALL combinations up to MAX_FACET_GROUPS_HARD. The display
+# cap exists purely to keep the page responsive - rendering 500 200-DPI
+# PNGs would take ~100 seconds.
 MAX_FACET_DISPLAY = 30
-
-# Above this number of combinations, the Excel download requires explicit
-# confirmation before the workbook is built. Below this, it's one click.
-EXCEL_CONFIRM_THRESHOLD = 30
 
 
 def _compute_metric_for_subset(df_subset, mode, **kwargs):
@@ -1450,6 +1446,62 @@ def _safe_sheet_name(name):
     return name or "Sheet"
 
 
+def _natural_sort_key(s):
+    """Sort key that handles numeric runs inside strings.
+
+    Used so age-bracket-style labels read in the expected order in the Excel:
+    '25-34' before '35-44' before '45-54'. For purely textual labels, falls
+    back to case-insensitive lexicographic order. '5-9' will sort before
+    '25-34' (lexicographic would put '25-34' first), so this is the right
+    default for any ordinal axis the user happens to pick.
+    """
+    import re
+    parts = re.split(r"(\d+)", str(s))
+    return tuple((1, int(p)) if p.isdigit() else (0, p.lower()) for p in parts if p != "")
+
+
+def _build_excel_cell_data(facet_results, facet_cols, tab_axis_col):
+    """Build {(tab_name, block_label): (metric_series, unknown_count)}.
+
+    Centralised so both the live preview and the workbook builder use the
+    exact same mapping - no risk of them diverging. tab_name is the value
+    of the tab-axis column (or "All" when there's no tab axis); block_label
+    is the " · "-joined values of the remaining facet columns (or "All" when
+    there's no side-by-side axis).
+    """
+    cell_data = {}
+    if not facet_cols:
+        # Degenerate single-ranking case
+        _fkey, _lbl, _sub, metric, unknown = facet_results[0]
+        cell_data[("All", "All")] = (metric, unknown)
+        return cell_data
+
+    if not tab_axis_col or tab_axis_col == "(All in one tab)":
+        for entry in facet_results:
+            label = entry[1] or "All"
+            cell_data[("All", label)] = (entry[3], entry[4])
+        return cell_data
+
+    tab_axis_idx = facet_cols.index(tab_axis_col)
+    side_cols = [c for c in facet_cols if c != tab_axis_col]
+    for entry in facet_results:
+        fkey = entry[0]
+        tab_val = fkey[tab_axis_idx]
+        tab_name = "(blank)" if (tab_val is None or
+                                  (isinstance(tab_val, float) and pd.isna(tab_val))) \
+                              else str(tab_val)
+        if side_cols:
+            side_vals = [fkey[facet_cols.index(c)] for c in side_cols]
+            block_label = " · ".join(
+                "(blank)" if (v is None or (isinstance(v, float) and pd.isna(v)))
+                else str(v) for v in side_vals
+            )
+        else:
+            block_label = "All"
+        cell_data[(tab_name, block_label)] = (entry[3], entry[4])
+    return cell_data
+
+
 def _summarise_excel_layout(facet_results, facet_cols, tab_axis_col):
     """Return a dict summarising the Excel structure for the live preview.
 
@@ -1457,21 +1509,24 @@ def _summarise_excel_layout(facet_results, facet_cols, tab_axis_col):
     report tab names, side-by-side block labels per tab, and totals. Cheap
     to call on every rerun so the preview updates as the user toggles options.
 
+    Side-by-side blocks within each tab are sorted ascending using natural
+    sort (so age brackets read 25-34 → 35-44 → 45-54 left to right). Tabs
+    keep their original order, which is row count descending.
+
     Output keys:
       tabs:         list of tab names (strings, one per Excel sheet)
-      blocks_by_tab: dict mapping tab name → list of side-by-side block labels
+      blocks_by_tab: dict mapping tab name → sorted list of block labels
       n_tabs:       int
       n_blocks:     int (total rankings across all tabs)
       side_cols:    list of facet column names used as side-by-side axes
     """
     if not facet_cols:
-        # No facets - degenerate "one tab, one block" case
         return {"tabs": ["All"], "blocks_by_tab": {"All": ["All"]},
                 "n_tabs": 1, "n_blocks": 1, "side_cols": []}
 
-    # No tab axis = one tab with everything side-by-side
     if not tab_axis_col or tab_axis_col == "(All in one tab)":
         labels = [entry[1] or "All" for entry in facet_results]
+        labels = sorted(labels, key=_natural_sort_key)
         return {"tabs": ["All"], "blocks_by_tab": {"All": labels},
                 "n_tabs": 1, "n_blocks": len(labels), "side_cols": facet_cols}
 
@@ -1498,6 +1553,11 @@ def _summarise_excel_layout(facet_results, facet_cols, tab_axis_col):
         else:
             block_label = "All"
         blocks_by_tab[tab_name].append(block_label)
+
+    # Sort blocks within each tab ascending (natural sort). This is what
+    # gives "25-34 → 35-44 → 45-54" left-to-right within each Country tab.
+    for tab in blocks_by_tab:
+        blocks_by_tab[tab] = sorted(blocks_by_tab[tab], key=_natural_sort_key)
 
     return {
         "tabs": tabs_in_order,
@@ -1533,36 +1593,12 @@ def build_excel_workbook(facet_results, facet_cols, tab_axis_col, item_label,
     # ===== Determine sheet groupings =====
     layout = _summarise_excel_layout(facet_results, facet_cols, tab_axis_col)
     tabs = layout["tabs"]
-    blocks_by_tab = layout["blocks_by_tab"]
+    blocks_by_tab = layout["blocks_by_tab"]  # already sorted ascending within each tab
     side_cols = layout["side_cols"]
 
-    # Map (tab_name, block_label) → metric/unknown so we can pull data per cell
-    cell_data = {}  # {(tab_name, block_label): (metric, unknown)}
-    if not facet_cols:
-        # Single ranking case - just one block on one tab
-        _fkey, _lbl, _sub, metric, unknown = facet_results[0]
-        cell_data[("All", "All")] = (metric, unknown)
-    elif not tab_axis_col or tab_axis_col == "(All in one tab)":
-        for entry in facet_results:
-            label = entry[1] or "All"
-            cell_data[("All", label)] = (entry[3], entry[4])
-    else:
-        tab_axis_idx = facet_cols.index(tab_axis_col)
-        for entry in facet_results:
-            fkey = entry[0]
-            tab_val = fkey[tab_axis_idx]
-            tab_name = "(blank)" if (tab_val is None or
-                                      (isinstance(tab_val, float) and pd.isna(tab_val))) \
-                                  else str(tab_val)
-            if side_cols:
-                side_vals = [fkey[facet_cols.index(c)] for c in side_cols]
-                block_label = " · ".join(
-                    "(blank)" if (v is None or (isinstance(v, float) and pd.isna(v)))
-                    else str(v) for v in side_vals
-                )
-            else:
-                block_label = "All"
-            cell_data[(tab_name, block_label)] = (entry[3], entry[4])
+    # Map (tab_name, block_label) → metric/unknown via the shared helper so
+    # the preview and the workbook are guaranteed to agree.
+    cell_data = _build_excel_cell_data(facet_results, facet_cols, tab_axis_col)
 
     # ===== Styling constants =====
     title_font = Font(name="Calibri", size=12, bold=True, color="FFFFFF")
@@ -1695,6 +1731,151 @@ def build_excel_workbook(facet_results, facet_cols, tab_axis_col, item_label,
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+def render_excel_preview_html(facet_results, facet_cols, tab_axis_col,
+                              item_label, value_label, exclude_set,
+                              selected_tab_idx=0, preview_rows=5):
+    """Build an HTML mockup of the Excel structure for inline preview.
+
+    Renders two things:
+      1. A faux "tab strip" along the top showing each sheet's name, with the
+         user-selected tab highlighted in Beauhurst purple. Lets the user
+         see at a glance how many tabs there will be and what they're called.
+      2. The contents of the selected tab, with each side-by-side block
+         rendered as a small table (block header in purple, then column
+         headers, then top-N rows of real data).
+
+    Returns the HTML string; the caller is responsible for wrapping it in
+    st.markdown(..., unsafe_allow_html=True). Cheap to call - all data is
+    already computed and cached in facet_results.
+    """
+    import html as _html
+
+    if not facet_results:
+        return "<p style='color:#6B6B72'><em>No data to preview.</em></p>"
+
+    layout = _summarise_excel_layout(facet_results, facet_cols, tab_axis_col)
+    cell_data = _build_excel_cell_data(facet_results, facet_cols, tab_axis_col)
+
+    tabs = layout["tabs"]
+    blocks_by_tab = layout["blocks_by_tab"]
+
+    # Clamp the selected tab to the available range
+    selected_tab_idx = max(0, min(selected_tab_idx, len(tabs) - 1))
+    selected_tab = tabs[selected_tab_idx]
+
+    # === Tab strip ===
+    # Show up to ~12 tabs inline; if there are more, show an overflow indicator
+    visible_tab_limit = 12
+    visible_tabs = tabs[:visible_tab_limit]
+    overflow_count = max(0, len(tabs) - visible_tab_limit)
+
+    tab_strip_parts = ['<div style="margin-bottom:8px; padding-bottom:6px; '
+                       'border-bottom:2px solid #4B4897;">']
+    for i, t in enumerate(visible_tabs):
+        is_selected = (i == selected_tab_idx)
+        tab_strip_parts.append(
+            f'<span style="display:inline-block; padding:5px 12px; margin-right:3px; '
+            f'background:{"#4B4897" if is_selected else "#E8E6E0"}; '
+            f'color:{"#FFFFFF" if is_selected else "#1A1A1F"}; '
+            f'font-weight:{"600" if is_selected else "500"}; '
+            f'border-radius:4px 4px 0 0; font-size:12px; '
+            f'font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;">'
+            f'{_html.escape(str(t))}</span>'
+        )
+    if overflow_count > 0:
+        tab_strip_parts.append(
+            f'<span style="display:inline-block; padding:5px 10px; '
+            f'color:#6B6B72; font-size:11px; font-style:italic; '
+            f'font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;">'
+            f'+{overflow_count} more tab{"s" if overflow_count != 1 else ""}</span>'
+        )
+    tab_strip_parts.append('</div>')
+
+    # === Selected tab content (blocks side-by-side) ===
+    block_labels = blocks_by_tab.get(selected_tab, [])
+    # Cap blocks shown in preview to keep it scannable
+    visible_block_limit = 6
+    visible_blocks = block_labels[:visible_block_limit]
+    blocks_overflow = max(0, len(block_labels) - visible_block_limit)
+
+    content_parts = []
+    if not visible_blocks:
+        content_parts.append('<p style="color:#6B6B72"><em>No blocks in this tab.</em></p>')
+    else:
+        content_parts.append(
+            '<div style="overflow-x:auto; white-space:nowrap; '
+            'padding:8px; background:#FAF8F5; border:1px solid #D0CDC4; '
+            'border-radius:4px;">'
+        )
+        for block_label in visible_blocks:
+            metric, unknown = cell_data.get((selected_tab, block_label), (None, 0))
+            if metric is None:
+                continue
+            rows_html_parts = []
+            preview_items = list(metric.head(preview_rows).items())
+            for rank, (item, val) in enumerate(preview_items, start=1):
+                in_chart = "No" if item in exclude_set else "Yes"
+                val_display = (f"{val:,.0f}" if pd.notna(val) and float(val).is_integer()
+                               else f"{val:,.2f}" if pd.notna(val) else "")
+                # Truncate long item names so the preview stays scannable
+                item_display = _html.escape(str(item))
+                if len(item_display) > 26:
+                    item_display = item_display[:24] + "…"
+                rows_html_parts.append(
+                    f'<tr>'
+                    f'<td style="text-align:right; padding:2px 8px; color:#6B6B72;">{rank}</td>'
+                    f'<td style="padding:2px 8px;">{item_display}</td>'
+                    f'<td style="text-align:right; padding:2px 8px; font-variant-numeric:tabular-nums;">{val_display}</td>'
+                    f'<td style="text-align:center; padding:2px 8px; color:{"#999" if in_chart == "No" else "#1A1A1F"};">{in_chart}</td>'
+                    f'</tr>'
+                )
+            if unknown and unknown > 0:
+                rows_html_parts.append(
+                    f'<tr style="color:#6B6B72; font-style:italic;">'
+                    f'<td style="padding:2px 8px;"></td>'
+                    f'<td style="padding:2px 8px;">Unknown</td>'
+                    f'<td style="text-align:right; padding:2px 8px; font-variant-numeric:tabular-nums;">{unknown:,}</td>'
+                    f'<td style="text-align:center; padding:2px 8px;">—</td>'
+                    f'</tr>'
+                )
+            more_rows = max(0, len(metric) - preview_rows)
+            if more_rows > 0:
+                rows_html_parts.append(
+                    f'<tr style="color:#6B6B72; font-style:italic;">'
+                    f'<td colspan="4" style="padding:2px 8px;">+{more_rows} more row{"s" if more_rows != 1 else ""}</td>'
+                    f'</tr>'
+                )
+
+            content_parts.append(
+                f'<div style="display:inline-block; vertical-align:top; margin-right:12px; '
+                f'border:1px solid #D0CDC4; border-radius:3px; overflow:hidden; '
+                f'font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;">'
+                f'<div style="background:#4B4897; color:#FFFFFF; padding:5px 10px; '
+                f'font-weight:600; font-size:12px;">{_html.escape(str(block_label))}</div>'
+                f'<table style="border-collapse:collapse; font-size:11px; background:#FFFFFF;">'
+                f'<thead><tr style="background:#E8E6E0; font-weight:600;">'
+                f'<th style="padding:3px 8px; text-align:right;">#</th>'
+                f'<th style="padding:3px 8px; text-align:left;">{_html.escape(item_label)}</th>'
+                f'<th style="padding:3px 8px; text-align:right;">{_html.escape(value_label)}</th>'
+                f'<th style="padding:3px 8px; text-align:center;">In Chart</th>'
+                f'</tr></thead>'
+                f'<tbody>{"".join(rows_html_parts)}</tbody>'
+                f'</table>'
+                f'</div>'
+            )
+        if blocks_overflow > 0:
+            content_parts.append(
+                f'<span style="display:inline-block; vertical-align:top; '
+                f'padding:30px 12px; color:#6B6B72; font-size:11px; '
+                f'font-style:italic; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;">'
+                f'+{blocks_overflow} more block{"s" if blocks_overflow != 1 else ""}<br>'
+                f'in this tab</span>'
+            )
+        content_parts.append('</div>')
+
+    return "".join(tab_strip_parts) + "".join(content_parts)
 
 
 def _render_filter_editor_body(df, current_source):
@@ -2601,142 +2782,50 @@ if uploaded_file:
 
             # Branch downloads by whether we're faceted or not
             if facet_cols_valid:
-                # === Multi-tab Excel export ===
-                # Pick the "tab axis" - one of the facet columns. Remaining
-                # facets become the side-by-side axis within each tab.
-                st.markdown("**Excel layout**")
-                tab_options = ["(All in one tab)"] + list(facet_cols_valid)
-                # Default to the first facet column ("one tab per first facet")
-                # which matches the typical Beauhurst use case (one tab per
-                # country, age brackets side-by-side).
-                default_idx = 1 if len(facet_cols_valid) >= 1 else 0
-                tab_axis_choice = st.selectbox(
-                    "One tab per…",
-                    tab_options,
-                    index=default_idx,
-                    key="excel_tab_axis",
-                    help="Pick which facet column drives the Excel tabs. The "
-                         "remaining facet columns become side-by-side rankings "
-                         "within each tab. '(All in one tab)' puts everything "
-                         "in a single sheet, side-by-side."
-                )
-                tab_axis_for_excel = None if tab_axis_choice == "(All in one tab)" else tab_axis_choice
-
-                # Live preview - cheap, just inspects the existing facet_results
-                layout_summary = _summarise_excel_layout(
-                    facet_results, facet_cols_valid, tab_axis_for_excel
-                )
-                n_tabs = layout_summary["n_tabs"]
-                n_blocks = layout_summary["n_blocks"]
-
-                # Preview block — show first few tabs + first few blocks-per-tab
-                preview_lines = []
-                preview_lines.append(
-                    f"**{n_tabs} tab{'s' if n_tabs != 1 else ''}**, "
-                    f"**{n_blocks} ranking{'s' if n_blocks != 1 else ''}** total"
-                )
-                if layout_summary["side_cols"]:
-                    preview_lines.append(
-                        f"_Side-by-side axis:_ {' · '.join(layout_summary['side_cols'])}"
-                    )
-                # Sample of tabs
-                sample_tabs = layout_summary["tabs"][:5]
-                more_tabs = max(0, n_tabs - len(sample_tabs))
-                preview_lines.append(
-                    "_Tab names:_ " + ", ".join(sample_tabs)
-                    + (f", +{more_tabs} more" if more_tabs else "")
-                )
-                # Sample of blocks for the first tab
-                if sample_tabs and layout_summary["blocks_by_tab"].get(sample_tabs[0]):
-                    first_blocks = layout_summary["blocks_by_tab"][sample_tabs[0]]
-                    sample_blocks = first_blocks[:4]
-                    more_blocks = max(0, len(first_blocks) - len(sample_blocks))
-                    preview_lines.append(
-                        f"_Inside `{sample_tabs[0]}`:_ "
-                        + ", ".join(sample_blocks)
-                        + (f", +{more_blocks} more" if more_blocks else "")
-                    )
-                st.info("  \n".join(preview_lines))
-
-                # Confirmation gate for large outputs
-                workbook_args = (
-                    facet_results, facet_cols_valid, tab_axis_for_excel,
-                    item_label, value_label, exclude_set, chart_title,
-                )
-                # Confirmation is keyed by (combination count, tab axis choice).
-                # Changing either invalidates the confirmation so the user
-                # always re-confirms after meaningfully changing the layout.
-                confirm_key = ("_excel_confirmed", n_blocks, tab_axis_for_excel)
-                excel_ready = (
-                    n_blocks <= EXCEL_CONFIRM_THRESHOLD
-                    or st.session_state.get("_excel_confirm_token") == confirm_key
-                )
-
-                if not excel_ready:
-                    st.warning(
-                        f"⚠️ {n_blocks:,} rankings would be in this Excel file. "
-                        f"That's above the {EXCEL_CONFIRM_THRESHOLD}-ranking comfort "
-                        f"threshold — building it may take a few seconds and the "
-                        f"file will be sizeable."
-                    )
-                    if st.button("✅ Yes, build the Excel file", key="confirm_excel"):
-                        st.session_state["_excel_confirm_token"] = confirm_key
-                        st.rerun()
-
-                # === Three download buttons (same row): Excel, SVG zip, PNG zip ===
+                # === Faceted case: sidebar shows ZIP downloads only ===
+                # The Excel download lives in the main area below the charts -
+                # it needs more room for the layout picker + visual preview, so
+                # we keep only the simple ZIPs here. The filename input above
+                # is shared (read from session_state by the main-area code).
                 _zip_args = (
                     facet_results[:MAX_FACET_DISPLAY], exclude_set, top_n, rank_mode,
                     chart_title, is_money, fmt_kind,
                 )
 
-                col_a, col_b, col_c = st.columns(3)
-                if excel_ready:
-                    col_a.download_button(
-                        "Excel (.xlsx)",
-                        data=lambda a=workbook_args: build_excel_workbook(*a),
-                        file_name=f"{filename_stem}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        help=f"Multi-tab workbook. {n_tabs} tab(s), {n_blocks} ranking(s) "
-                             "side-by-side within each tab. Built on click.",
-                    )
-                else:
-                    # Disabled placeholder until confirmation
-                    col_a.button(
-                        "Excel (.xlsx)",
-                        disabled=True,
-                        help="Confirm above to enable this download.",
-                    )
-                col_b.download_button(
+                col_a, col_b = st.columns(2)
+                col_a.download_button(
                     "SVGs (.zip)",
                     data=lambda a=_zip_args: build_chart_zip(*a, format_="svg"),
                     file_name=f"{filename_stem}_svgs.zip",
                     mime="application/zip",
-                    help=f"One SVG per group (capped at the top {MAX_FACET_DISPLAY} "
-                         "displayed on screen), bundled into a ZIP.",
+                    help=f"One SVG per group (top {MAX_FACET_DISPLAY} displayed on screen), "
+                         "bundled into a ZIP.",
                 )
-                col_c.download_button(
+                col_b.download_button(
                     "PNGs (.zip)",
                     data=lambda a=_zip_args: build_chart_zip(*a, format_="png_hires"),
                     file_name=f"{filename_stem}_pngs.zip",
                     mime="application/zip",
-                    help=f"One 300 DPI PNG per group (capped at the top {MAX_FACET_DISPLAY} "
-                         "displayed on screen), bundled into a ZIP.",
+                    help=f"One 300 DPI PNG per group (top {MAX_FACET_DISPLAY} displayed on screen), "
+                         "bundled into a ZIP.",
                 )
 
-                # Captions
-                total_unknown = sum(u for _, _, _, _, u in facet_results)
-                if total_unknown > 0:
-                    st.caption(
-                        f"Excel includes per-group 'Unknown' rows ({total_unknown:,} "
-                        f"row{'s' if total_unknown != 1 else ''} total without a value)."
-                    )
+                st.caption(
+                    "📊 **Excel download** is below the charts in the main area "
+                    "— it has its own layout picker and live preview."
+                )
+
                 if exclude:
                     st.caption(
-                        f"Excluded from charts (kept in Excel with In Chart = No): "
+                        f"Excluded from charts: "
                         f"{', '.join(exclude[:3])}"
                         + (f", +{len(exclude) - 3} more" if len(exclude) > 3 else "")
                         + "."
                     )
+
+                # Store labels in session_state for the main-area Excel section
+                st.session_state["_excel_item_label"] = item_label
+                st.session_state["_excel_value_label"] = value_label
             else:
                 # Single ranking - original side-by-side CSV layout
                 (_facet_key, facet_label, sub_df, metric_series, unknown_count) = facet_results[0]
@@ -2790,5 +2879,124 @@ if uploaded_file:
                         f"Chart half of CSV omits {chart_exclusion_count} item{'s' if chart_exclusion_count != 1 else ''} "
                         f"from the 'Exclude from chart' list; Full half keeps them."
                     )
+
+        # ====================================================================
+        # === Excel layout picker + visual preview (main area, faceted only) =
+        # ====================================================================
+        # Sits below the on-screen charts, replacing what used to be the
+        # in-sidebar Excel block. The whole section is dedicated to showing
+        # the user what the Excel will look like and letting them choose the
+        # layout, so it gets the main area's width. The actual workbook is
+        # built lazily on click of the download button at the bottom.
+        if facet_cols_valid:
+            st.markdown("---")
+            st.markdown("### 📊 Build Excel")
+            st.caption(
+                "The Excel file contains a ranking for every combination of facet "
+                "values, organised into tabs. Choose the layout below — the preview "
+                "shows exactly what one sheet will look like when you open the file."
+            )
+
+            # Read filename + labels from session_state (set by the sidebar block above)
+            _filename_stem = st.session_state.get("_filename_stem", "ranking")
+            _excel_item_label = st.session_state.get("_excel_item_label", "Item")
+            _excel_value_label = st.session_state.get("_excel_value_label", "Value")
+
+            # === Layout picker ===
+            picker_cols = st.columns([2, 2, 3])
+
+            with picker_cols[0]:
+                # Tab axis = one of the facet columns (or none = everything side-by-side
+                # in a single sheet)
+                tab_options = ["(All in one tab)"] + list(facet_cols_valid)
+                # Default to first facet column (typical Beauhurst layout:
+                # one tab per country, age brackets side-by-side)
+                default_idx = 1 if len(facet_cols_valid) >= 1 else 0
+                tab_axis_choice = st.selectbox(
+                    "One tab per…",
+                    tab_options,
+                    index=default_idx,
+                    key="excel_tab_axis",
+                    help="Which facet column drives the Excel tabs. The remaining "
+                         "facet columns become side-by-side rankings within each tab.",
+                )
+                tab_axis_for_excel = (
+                    None if tab_axis_choice == "(All in one tab)" else tab_axis_choice
+                )
+
+            # Compute layout summary (cheap)
+            layout_summary = _summarise_excel_layout(
+                facet_results, facet_cols_valid, tab_axis_for_excel
+            )
+            n_tabs = layout_summary["n_tabs"]
+            n_blocks = layout_summary["n_blocks"]
+            side_cols = layout_summary["side_cols"]
+            tabs_list = layout_summary["tabs"]
+
+            with picker_cols[1]:
+                # Pick which tab to preview. Reset to index 0 if the previous
+                # choice is no longer in the tabs list (e.g. user changed tab axis).
+                preview_options = tabs_list if tabs_list else ["(none)"]
+                # Stable widget key but invalidate selection when tab axis changes
+                preview_key = f"excel_preview_tab_{tab_axis_choice}"
+                if preview_key not in st.session_state:
+                    st.session_state[preview_key] = preview_options[0]
+                preview_tab_choice = st.selectbox(
+                    "Preview tab",
+                    preview_options,
+                    key=preview_key,
+                    help="Which Excel tab to render in the preview below. The "
+                         "Excel file will contain every tab, not just this one.",
+                    disabled=(len(preview_options) <= 1 and preview_options[0] == "(none)"),
+                )
+
+            with picker_cols[2]:
+                # Summary line - density of the output at a glance
+                st.markdown("&nbsp;", unsafe_allow_html=True)  # vertical spacer
+                summary_bits = [
+                    f"**{n_tabs}** tab{'s' if n_tabs != 1 else ''}",
+                    f"**{n_blocks}** ranking{'s' if n_blocks != 1 else ''} total",
+                ]
+                if side_cols:
+                    summary_bits.append(f"side-by-side by **{', '.join(side_cols)}**")
+                st.caption("  ·  ".join(summary_bits))
+
+            # === Visual preview ===
+            try:
+                selected_tab_idx = tabs_list.index(preview_tab_choice) if preview_tab_choice in tabs_list else 0
+            except (ValueError, AttributeError):
+                selected_tab_idx = 0
+            preview_html = render_excel_preview_html(
+                facet_results, facet_cols_valid, tab_axis_for_excel,
+                _excel_item_label, _excel_value_label, exclude_set,
+                selected_tab_idx=selected_tab_idx, preview_rows=5,
+            )
+            st.markdown(preview_html, unsafe_allow_html=True)
+
+            # === Download button ===
+            workbook_args = (
+                facet_results, facet_cols_valid, tab_axis_for_excel,
+                _excel_item_label, _excel_value_label, exclude_set, chart_title,
+            )
+            dl_cols = st.columns([2, 3])
+            with dl_cols[0]:
+                st.download_button(
+                    "⬇️ Download Excel (.xlsx)",
+                    data=lambda a=workbook_args: build_excel_workbook(*a),
+                    file_name=f"{_filename_stem}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary",
+                    help=f"Multi-tab workbook with {n_tabs} tab(s) and {n_blocks} "
+                         f"ranking(s) total. Built when you click.",
+                    use_container_width=True,
+                )
+            with dl_cols[1]:
+                total_unknown = sum(u for _, _, _, _, u in facet_results)
+                if total_unknown > 0:
+                    st.caption(
+                        f"Excel includes per-group 'Unknown' rows ({total_unknown:,} "
+                        f"row{'s' if total_unknown != 1 else ''} total without a value)."
+                    )
+
 else:
     st.info("Please upload a file to begin.")
