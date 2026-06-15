@@ -533,20 +533,31 @@ def _clean_columns(df):
 def _is_date_column(series, threshold=0.5):
     """Heuristic: does this column contain dates?
 
-    True if at least `threshold` fraction of non-null values parse as datetime.
-    Skips columns that are already numeric (so Excel-style year integers don't
-    accidentally trigger derivation - the user has to want this).
+    True if at least `threshold` fraction of non-null values look like dates
+    AND parse as datetime. Skips columns that are already numeric.
 
-    Tries both default (ISO/US-leaning) AND dayfirst=True (UK) parsing and
-    keeps whichever produces more non-NaT values. This is necessary because
-    dayfirst=True actively mis-parses unambiguous ISO 8601 dates ('2025-01-02'
-    becomes 1 Feb 2025), while default parsing mis-handles unambiguous UK
-    dates ('15/04/2024' becomes NaT under US assumption month=15). Best-of-
-    both covers the full set of Beauhurst export formats without false
-    positives or negatives.
+    The two key guards:
 
-    Threshold is 50% to tolerate columns with a few stray non-parseable
-    values (e.g., 'TBD' rows in an otherwise-date column).
+    1. **Strings only**: pd.to_datetime treats raw integers as Unix
+       nanoseconds, so int 0 → '1970-01-01 00:00:00' and int 1 →
+       '1970-01-01 00:00:00.000000001'. This means an object-dtype column
+       containing integers (very common in CSVs where some rows have ints
+       and others have '(no value)' strings — e.g. Beauhurst's 'Count of
+       female directors (All time)') would falsely pass any naive parse
+       test. We filter to string values first.
+
+    2. **Date-like regex**: even among string values, we require at least
+       one date separator ('-' or '/') or a month abbreviation. This rules
+       out columns of stringified integers ('1', '23') and free-text
+       labels ('Growth', 'Seed', 'TBD') from sneaking through. All real
+       Beauhurst date formats (ISO 8601, UK DD/MM/YYYY, etc.) contain
+       one of these markers.
+
+    Tries both default (ISO/US-leaning) AND dayfirst=True (UK) parsing on
+    the date-like subset, keeping whichever yields more valid timestamps.
+    The threshold is computed against the ORIGINAL non-null count so that
+    a column with mostly non-date values fails detection even if the few
+    date-looking values inside happen to parse.
     """
     if pd.api.types.is_datetime64_any_dtype(series):
         return True
@@ -555,13 +566,27 @@ def _is_date_column(series, threshold=0.5):
     non_null = series.dropna()
     if len(non_null) == 0:
         return False
+
+    # Guard 1: keep only string values
+    str_mask = non_null.map(lambda v: isinstance(v, str))
+    str_values = non_null[str_mask]
+    if len(str_values) == 0:
+        return False
+
+    # Guard 2: require a date-like hint (separator or month name)
+    import re
+    _DATE_HINT = re.compile(
+        r"[-/]|\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)",
+        re.IGNORECASE,
+    )
+    date_like = str_values[str_values.map(lambda s: bool(_DATE_HINT.search(s)))]
+    if len(date_like) / len(non_null) < threshold:
+        return False
+
     try:
-        parsed_default = pd.to_datetime(non_null, errors="coerce")
-        parsed_dayfirst = pd.to_datetime(non_null, errors="coerce", dayfirst=True)
-        best_count = max(
-            parsed_default.notna().sum(),
-            parsed_dayfirst.notna().sum(),
-        )
+        parsed_default = pd.to_datetime(date_like, errors="coerce")
+        parsed_dayfirst = pd.to_datetime(date_like, errors="coerce", dayfirst=True)
+        best_count = max(parsed_default.notna().sum(), parsed_dayfirst.notna().sum())
         return best_count / len(non_null) >= threshold
     except Exception:
         return False
@@ -574,18 +599,22 @@ def _parse_dates_best(col_series):
     parsing; UK DD/MM/YYYY prefers dayfirst=True. We try both and keep the
     one that produces more valid Timestamps.
 
-    Tie-breaking: when both strategies produce the same count of valid
-    timestamps (the most common situation in practice — ambiguous strings
-    like '08/01/2016' parse cleanly under EITHER interpretation, yielding
-    a tie), we pick the dayfirst (UK) result. Beauhurst exports are
-    UK-formatted, so the UK reading is the correct one when both are valid.
-    Default parsing only wins when it produces STRICTLY MORE valid values,
-    which happens for ISO 8601 strings (where dayfirst mis-parses them).
+    Non-string values are nulled out before parsing so stray integers in a
+    mostly-string column don't get turned into 1970-01-01 by pd.to_datetime's
+    nanosecond interpretation. Real Timestamp columns are returned as-is
+    via the early datetime64 check.
+
+    Tie-breaking: when both strategies produce the same count (the common
+    ambiguous case — '08/01/2016' parses cleanly under EITHER), pick the
+    dayfirst (UK) result. Beauhurst exports are UK-formatted, so UK wins
+    ties. Default only wins when strictly more values parse (ISO 8601 case).
     """
     if pd.api.types.is_datetime64_any_dtype(col_series):
         return col_series
-    p1 = pd.to_datetime(col_series, errors="coerce")
-    p2 = pd.to_datetime(col_series, errors="coerce", dayfirst=True)
+    # Replace non-string values with NaT before parsing
+    str_only = col_series.where(col_series.map(lambda v: isinstance(v, str)), pd.NaT)
+    p1 = pd.to_datetime(str_only, errors="coerce")
+    p2 = pd.to_datetime(str_only, errors="coerce", dayfirst=True)
     return p1 if p1.notna().sum() > p2.notna().sum() else p2
 
 
