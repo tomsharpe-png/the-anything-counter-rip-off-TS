@@ -1458,10 +1458,6 @@ MAX_FACET_GROUPS_HARD = 500
 # PNGs would take ~100 seconds.
 MAX_FACET_DISPLAY = 30
 
-# Above this number of combinations, the Excel download requires explicit
-# confirmation before the workbook is built. Below this, it's one click.
-EXCEL_CONFIRM_THRESHOLD = 30
-
 
 def _compute_metric_for_subset(df_subset, mode, **kwargs):
     """Compute a sorted metric_series for a subset DataFrame.
@@ -2044,53 +2040,28 @@ def render_excel_section_fragment(facet_results, facet_cols_valid, chart_title,
     )
     st.markdown(preview_html, unsafe_allow_html=True)
 
-    # Download. Confirmation gate kicks in only above the threshold based on
-    # the total cell count (rows × cols), since that's the actual size of
-    # the workbook.
+    # Download. The workbook is built lazily when the user clicks (the `data`
+    # arg is a no-arg callable, not the bytes themselves) - so even very
+    # large pivots cost nothing until the user actually wants the file.
+    # There's no confirmation gate: clicking the download button does the
+    # work, which is the natural mental model.
     workbook_args = (
         facet_results, facet_cols_valid,
         item_label, value_label, exclude_set, chart_title,
     )
-    n_cells = n_items * n_columns
-    confirm_key = ("_excel_confirmed", n_cells)
-    excel_ready = (
-        n_cells <= EXCEL_CONFIRM_THRESHOLD * 30  # 30 facets × 30 items = 900 cells default
-        or st.session_state.get("_excel_confirm_token") == confirm_key
-    )
-
-    if not excel_ready:
-        st.warning(
-            f"⚠️ This pivot would have **{n_cells:,} cells** "
-            f"(**{n_items:,}** items × **{n_columns:,}** columns). "
-            f"Building may take a few seconds. Confirm below if that's "
-            f"what you want."
-        )
-        if st.button("✅ Yes, build the Excel file",
-                     key="confirm_excel",
-                     help="Confirmation resets if the data changes."):
-            st.session_state["_excel_confirm_token"] = confirm_key
-            st.rerun()
 
     dl_cols = st.columns([2, 3])
     with dl_cols[0]:
-        if excel_ready:
-            st.download_button(
-                "⬇️ Download Excel (.xlsx)",
-                data=lambda a=workbook_args: build_excel_workbook(*a),
-                file_name=f"{filename_stem}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary",
-                help=f"Single-tab pivot table: {n_items} items × {n_columns} columns. "
-                     f"Built when you click.",
-                use_container_width=True,
-            )
-        else:
-            st.button(
-                "⬇️ Download Excel (.xlsx)",
-                disabled=True,
-                help="Click '✅ Yes, build the Excel file' above to enable.",
-                use_container_width=True,
-            )
+        st.download_button(
+            "⬇️ Download Excel (.xlsx)",
+            data=lambda a=workbook_args: build_excel_workbook(*a),
+            file_name=f"{filename_stem}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+            help=f"Single-tab pivot table: {n_items} items × {n_columns} columns. "
+                 f"Built when you click.",
+            use_container_width=True,
+        )
     with dl_cols[1]:
         if exclude_set:
             st.caption(
