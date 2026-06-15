@@ -530,12 +530,23 @@ def _clean_columns(df):
     return df
 
 
-def _is_date_column(series, threshold=0.8):
+def _is_date_column(series, threshold=0.5):
     """Heuristic: does this column contain dates?
 
     True if at least `threshold` fraction of non-null values parse as datetime.
     Skips columns that are already numeric (so Excel-style year integers don't
     accidentally trigger derivation - the user has to want this).
+
+    Tries both default (ISO/US-leaning) AND dayfirst=True (UK) parsing and
+    keeps whichever produces more non-NaT values. This is necessary because
+    dayfirst=True actively mis-parses unambiguous ISO 8601 dates ('2025-01-02'
+    becomes 1 Feb 2025), while default parsing mis-handles unambiguous UK
+    dates ('15/04/2024' becomes NaT under US assumption month=15). Best-of-
+    both covers the full set of Beauhurst export formats without false
+    positives or negatives.
+
+    Threshold is 50% to tolerate columns with a few stray non-parseable
+    values (e.g., 'TBD' rows in an otherwise-date column).
     """
     if pd.api.types.is_datetime64_any_dtype(series):
         return True
@@ -545,10 +556,29 @@ def _is_date_column(series, threshold=0.8):
     if len(non_null) == 0:
         return False
     try:
-        parsed = pd.to_datetime(non_null, errors="coerce")
-        return parsed.notna().sum() / len(non_null) >= threshold
+        parsed_default = pd.to_datetime(non_null, errors="coerce")
+        parsed_dayfirst = pd.to_datetime(non_null, errors="coerce", dayfirst=True)
+        best_count = max(
+            parsed_default.notna().sum(),
+            parsed_dayfirst.notna().sum(),
+        )
+        return best_count / len(non_null) >= threshold
     except Exception:
         return False
+
+
+def _parse_dates_best(col_series):
+    """Parse a series of dates picking the better of default vs dayfirst.
+
+    Same best-of-both logic as _is_date_column: ISO 8601 prefers default
+    parsing; UK DD/MM/YYYY prefers dayfirst=True. We try both and keep the
+    one that produces more valid Timestamps.
+    """
+    if pd.api.types.is_datetime64_any_dtype(col_series):
+        return col_series
+    p1 = pd.to_datetime(col_series, errors="coerce")
+    p2 = pd.to_datetime(col_series, errors="coerce", dayfirst=True)
+    return p1 if p1.notna().sum() >= p2.notna().sum() else p2
 
 
 def _add_date_derivations(df):
@@ -567,7 +597,13 @@ def _add_date_derivations(df):
 
     Idempotent and conservative: already-derived columns are skipped; columns
     where the derived name would collide with existing data are skipped.
+
+    UK dates: dayfirst=True so '02/01/2025' parses as 2 Jan 2025.
+
+    Returns the list of source columns that produced derivations - used by
+    the calling UI to surface a "Detected date columns" diagnostic.
     """
+    derived_from = []
     # Snapshot the original columns so we don't iterate over our own insertions
     for col in list(df.columns):
         if not isinstance(col, str):
@@ -577,10 +613,10 @@ def _add_date_derivations(df):
         if not _is_date_column(df[col]):
             continue
 
-        if pd.api.types.is_datetime64_any_dtype(df[col]):
-            dates = df[col]
-        else:
-            dates = pd.to_datetime(df[col], errors="coerce")
+        # Pick whichever of the two parsing strategies (default / dayfirst)
+        # produced more valid Timestamps - so UK DD/MM/YYYY files and ISO
+        # 8601 files both get correctly parsed values.
+        dates = _parse_dates_best(df[col])
 
         year_col = f"{col} (Year)"
         quarter_col = f"{col} (Quarter)"
@@ -589,6 +625,7 @@ def _add_date_derivations(df):
         # have shifted right if earlier date columns added their derivations).
         # We insert immediately after it; insert_at advances as we add.
         insert_at = df.columns.get_loc(col) + 1
+        added_here = False
 
         if year_col not in df.columns:
             year_values = dates.dt.year.apply(
@@ -596,12 +633,22 @@ def _add_date_derivations(df):
             )
             df.insert(insert_at, year_col, year_values)
             insert_at += 1
+            added_here = True
         if quarter_col not in df.columns:
             quarter_values = [
                 f"Q{int(q)} {int(y)}" if pd.notna(q) and pd.notna(y) else ""
                 for q, y in zip(dates.dt.quarter, dates.dt.year)
             ]
             df.insert(insert_at, quarter_col, quarter_values)
+            added_here = True
+
+        if added_here:
+            derived_from.append(col)
+
+    # Cache the detected sources on the df itself, so the UI can read them
+    # without re-scanning column names. df.attrs survives cached returns.
+    df.attrs["_date_derived_from"] = derived_from
+    return derived_from
 
 
 @st.cache_data
@@ -2449,6 +2496,31 @@ with st.sidebar:
 
 if uploaded_file:
     df = load_data(uploaded_file, sheet_name)
+
+    # Surface what date columns the auto-derivation picked up, so the user
+    # can see at a glance whether their "Deal date" / "Funding date" etc.
+    # were detected. If something they expected isn't here, the threshold
+    # may need adjusting, or the column may have a format we can't parse.
+    _derived_from = df.attrs.get("_date_derived_from", [])
+    with st.sidebar:
+        if _derived_from:
+            st.caption(
+                "📅 Auto-derived **(Year)** and **(Quarter)** columns from: "
+                + ", ".join(f"`{c}`" for c in _derived_from)
+            )
+        else:
+            # Show suspected candidates so the user can confirm whether a
+            # date column was missed
+            _candidates = [c for c in df.columns if isinstance(c, str) and
+                           any(k in c.lower() for k in ("date", "time"))]
+            if _candidates:
+                st.caption(
+                    "📅 No date columns auto-detected. Columns with "
+                    "date-like names that didn't parse: "
+                    + ", ".join(f"`{c}`" for c in _candidates[:5])
+                    + ". The values may be in a format we can't read — "
+                    "let me know what they look like and I'll handle it."
+                )
 
     # Fingerprint of the current data source (file + sheet). Used everywhere
     # downstream as a cache key for per-data-source memoisation. Computed
