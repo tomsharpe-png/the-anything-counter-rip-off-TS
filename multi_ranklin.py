@@ -1756,17 +1756,27 @@ def _summarise_excel_layout(facet_results, facet_cols, tab_axis_col):
     }
 
 
-def build_excel_workbook(facet_results, facet_cols, tab_axis_col, item_label,
-                         value_label, exclude_set, workbook_title="Multi Ranklin"):
-    """Build an .xlsx workbook with multiple tabs of side-by-side rankings.
+def build_excel_workbook(facet_results, facet_cols, item_label, value_label,
+                         exclude_set, workbook_title="Multi Ranklin"):
+    """Build an .xlsx workbook with a single-tab PIVOT TABLE.
 
-    The user picks one facet column to be the "tab axis" - that produces one
-    Excel sheet per unique value. The remaining facet columns combine into a
-    "side-by-side axis" - each unique combination becomes a 3-column block
-    (Rank, Item, Value) within the sheet, separated by a blank spacer column.
+    Layout:
+      Row 1:      Title (e.g. "Top Industries by Year")
+      Row 3:      Header row - [item_label, facet_value_1, facet_value_2, ...]
+                  in natural sort order (so years/quarters read left-to-right
+                  in chronological order, not whatever order the data was in).
+      Row 4+:     One row per item. Column A is the item name; remaining
+                  columns are the count/sum of that item under each facet
+                  value. Items are sorted by total descending across all
+                  facet groups, so the highest-volume items appear at top.
 
-    Sheet 1 (always present) is an "Overview" sheet listing every tab and
-    block, so a user opening the file in Excel gets immediate orientation.
+    Cells without data show 0 (the zero-fill behaviour the user expects for
+    multi-ranking - every industry shows in every year, with 0 when there
+    were no deals). Excluded items (from the Exclude-from-chart list) are
+    dropped entirely from the pivot.
+
+    This is the single layout the tool produces - no more tab axis / side-
+    by-side blocks. One tab, one table, one download.
 
     Returns the .xlsx bytes ready to feed to st.download_button.
     """
@@ -1774,453 +1784,224 @@ def build_excel_workbook(facet_results, facet_cols, tab_axis_col, item_label,
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
 
+    # 1. Determine column headers (facet values, in natural sort order)
+    facet_labels = [entry[1] or "All" for entry in facet_results]
+    facet_labels = sorted(facet_labels, key=_natural_sort_key)
+
+    # Index: facet_label -> metric_series (lookup for cell values)
+    label_to_metric = {(entry[1] or "All"): entry[3] for entry in facet_results}
+
+    # 2. Collect every item across all groups, minus exclusions
+    all_items = set()
+    for entry in facet_results:
+        all_items.update(entry[3].index)
+    all_items -= exclude_set
+
+    # 3. Compute total per item across all facet groups, for row ordering
+    item_totals = {}
+    for item in all_items:
+        total = 0.0
+        for entry in facet_results:
+            metric = entry[3]
+            if item in metric.index:
+                v = metric[item]
+                if pd.notna(v):
+                    total += float(v)
+        item_totals[item] = total
+    sorted_items = sorted(all_items, key=lambda i: (-item_totals[i], str(i).lower()))
+
+    # 4. Build the workbook
     wb = openpyxl.Workbook()
-    wb.remove(wb.active)
+    sheet = wb.active
+    sheet.title = _safe_sheet_name(workbook_title or "Rankings")
 
-    # ===== Determine sheet groupings =====
-    layout = _summarise_excel_layout(facet_results, facet_cols, tab_axis_col)
-    tabs = layout["tabs"]
-    blocks_by_tab = layout["blocks_by_tab"]  # already sorted ascending within each tab
-    side_cols = layout["side_cols"]
+    # Title row
+    title_cell = sheet.cell(row=1, column=1, value=workbook_title)
+    title_cell.font = Font(name="Calibri", size=14, bold=True, color="1A1A1F")
+    if len(facet_labels) > 0:
+        # Merge title across all columns for visual centering
+        sheet.merge_cells(
+            start_row=1, start_column=1,
+            end_row=1, end_column=1 + len(facet_labels)
+        )
+        title_cell.alignment = Alignment(horizontal="left", vertical="center")
 
-    # Map (tab_name, block_label) → metric/unknown via the shared helper so
-    # the preview and the workbook are guaranteed to agree.
-    cell_data = _build_excel_cell_data(facet_results, facet_cols, tab_axis_col)
-
-    # ===== Styling constants =====
-    title_font = Font(name="Calibri", size=12, bold=True, color="FFFFFF")
-    title_fill = PatternFill(start_color="4B4897", end_color="4B4897", fill_type="solid")
-    header_font = Font(name="Calibri", size=10, bold=True)
-    header_fill = PatternFill(start_color="E8E6E0", end_color="E8E6E0", fill_type="solid")
+    # Header row (row 3): item label + facet values
+    purple_fill = PatternFill(start_color="4B4897", end_color="4B4897", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF", size=11, name="Calibri")
     thin = Side(border_style="thin", color="D0CDC4")
     cell_border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    # ===== Overview sheet =====
-    overview = wb.create_sheet(title="Overview")
-    overview["A1"] = workbook_title
-    overview["A1"].font = Font(name="Calibri", size=16, bold=True, color="1A1A1F")
-    overview["A2"] = f"{layout['n_tabs']} tab(s), {layout['n_blocks']} ranking(s) total"
-    overview["A2"].font = Font(name="Calibri", size=11, italic=True, color="6B6B72")
-    if tab_axis_col:
-        overview["A3"] = f"Tab axis: {tab_axis_col}"
-        overview["A3"].font = Font(name="Calibri", size=10, color="6B6B72")
-    if side_cols:
-        overview["A4"] = f"Side-by-side axis: {', '.join(side_cols)}"
-        overview["A4"].font = Font(name="Calibri", size=10, color="6B6B72")
+    item_hdr = sheet.cell(row=3, column=1, value=item_label)
+    item_hdr.font = header_font
+    item_hdr.fill = purple_fill
+    item_hdr.alignment = Alignment(horizontal="left", vertical="center")
+    item_hdr.border = cell_border
+    for col_idx, label in enumerate(facet_labels, start=2):
+        c = sheet.cell(row=3, column=col_idx, value=label)
+        c.font = header_font
+        c.fill = purple_fill
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        c.border = cell_border
 
-    overview["A6"] = "Tab"
-    overview["B6"] = "Rankings in this tab"
-    overview["A6"].font = header_font
-    overview["B6"].font = header_font
-    overview["A6"].fill = header_fill
-    overview["B6"].fill = header_fill
-    r = 7
-    for tab in tabs:
-        overview.cell(row=r, column=1, value=tab)
-        overview.cell(row=r, column=2, value=", ".join(blocks_by_tab[tab]))
-        r += 1
-    overview.column_dimensions["A"].width = 28
-    overview.column_dimensions["B"].width = 80
-
-    # ===== Data sheets =====
-    BLOCK_WIDTH = 3  # Rank, Item, Value
-    SPACER = 1
-    seen_safe_names = {"Overview"}
-
-    for tab_name in tabs:
-        # Excel sheet names must be unique and meet character constraints
-        safe = _safe_sheet_name(tab_name)
-        suffix = 2
-        while safe in seen_safe_names:
-            base = safe[: 31 - len(f" ({suffix})")]
-            safe = f"{base} ({suffix})"
-            suffix += 1
-        seen_safe_names.add(safe)
-        sheet = wb.create_sheet(title=safe)
-
-        # Title row at the very top: full tab name in case it was truncated
-        sheet.cell(row=1, column=1, value=tab_name).font = Font(
-            name="Calibri", size=14, bold=True, color="1A1A1F"
-        )
-
-        col_start = 1
-        for block_label in blocks_by_tab[tab_name]:
-            metric, unknown = cell_data.get((tab_name, block_label), (None, 0))
-            if metric is None:
-                continue
-
-            # Block header (row 3): block label spanning all 3 cols
-            for offset in range(BLOCK_WIDTH):
-                cell = sheet.cell(row=3, column=col_start + offset)
-                cell.fill = title_fill
-                cell.border = cell_border
-            hdr = sheet.cell(row=3, column=col_start, value=block_label)
-            hdr.font = title_font
-            hdr.alignment = Alignment(horizontal="left", vertical="center")
-            sheet.merge_cells(start_row=3, start_column=col_start,
-                              end_row=3, end_column=col_start + BLOCK_WIDTH - 1)
-
-            # Column headers (row 4)
-            for offset, h in enumerate(["Rank", item_label, value_label]):
-                cell = sheet.cell(row=4, column=col_start + offset, value=h)
-                cell.font = header_font
-                cell.fill = header_fill
-                cell.border = cell_border
-                cell.alignment = Alignment(horizontal="left", vertical="center")
-
-            # Data rows — drop excluded items so the Excel matches the on-screen
-            # chart's set of items. The full ranking (below chart top-N) is still
-            # included; only the user's "Exclude from chart" choices are removed.
-            # Ranks renumber after exclusion so the visible 1..N is contiguous.
-            if exclude_set:
-                items_iter = [(k, v) for k, v in metric.items() if k not in exclude_set]
+    # Data rows. Each cell: value for (item, facet). 0 for missing.
+    light_grid = Border(left=thin, right=thin, top=thin, bottom=thin)
+    for row_offset, item in enumerate(sorted_items):
+        row = 4 + row_offset
+        item_cell = sheet.cell(row=row, column=1, value=str(item))
+        item_cell.border = light_grid
+        for col_idx, label in enumerate(facet_labels, start=2):
+            metric = label_to_metric.get(label)
+            val = 0.0
+            if metric is not None and item in metric.index:
+                v = metric[item]
+                if pd.notna(v):
+                    val = float(v)
+            c = sheet.cell(row=row, column=col_idx, value=val)
+            c.border = light_grid
+            c.alignment = Alignment(horizontal="right")
+            # Format integers vs floats sensibly
+            if val == int(val):
+                c.number_format = "#,##0"
             else:
-                items_iter = list(metric.items())
-            row = 5
-            for rank, (item, val) in enumerate(items_iter, start=1):
-                sheet.cell(row=row, column=col_start, value=rank).border = cell_border
-                sheet.cell(row=row, column=col_start + 1, value=str(item)).border = cell_border
-                val_cell = sheet.cell(row=row, column=col_start + 2,
-                                       value=float(val) if pd.notna(val) else None)
-                val_cell.border = cell_border
-                # Format number columns. Decide format based on heuristic: very
-                # small or zero-decimal values format as integers; bigger as
-                # thousands-separated; otherwise use #,##0.00.
-                if pd.notna(val):
-                    if isinstance(val, (int, float)) and float(val).is_integer():
-                        val_cell.number_format = "#,##0"
-                    else:
-                        val_cell.number_format = "#,##0.00"
-                row += 1
+                c.number_format = "#,##0.00"
 
-            if unknown and unknown > 0:
-                sheet.cell(row=row, column=col_start, value="").border = cell_border
-                sheet.cell(row=row, column=col_start + 1, value="Unknown").border = cell_border
-                u_cell = sheet.cell(row=row, column=col_start + 2, value=int(unknown))
-                u_cell.border = cell_border
-                u_cell.number_format = "#,##0"
+    # Column widths
+    sheet.column_dimensions['A'].width = max(28, min(48, max((len(str(i)) for i in sorted_items), default=20) + 2))
+    for col_idx in range(2, len(facet_labels) + 2):
+        # Width based on header length plus some breathing room
+        header_len = len(str(facet_labels[col_idx - 2]))
+        sheet.column_dimensions[get_column_letter(col_idx)].width = max(10, min(20, header_len + 2))
 
-            # Column widths within the block
-            sheet.column_dimensions[get_column_letter(col_start)].width = 7      # Rank
-            sheet.column_dimensions[get_column_letter(col_start + 1)].width = 36  # Item (a bit wider since no In Chart)
-            sheet.column_dimensions[get_column_letter(col_start + 2)].width = 16  # Value
-            if col_start + BLOCK_WIDTH <= 16384:  # leave the spacer column blank
-                sheet.column_dimensions[get_column_letter(col_start + BLOCK_WIDTH)].width = 2
-
-            col_start += BLOCK_WIDTH + SPACER
-
-        # Freeze the title + header rows
-        sheet.freeze_panes = "A5"
-
-    # Move Overview to the front
-    wb.move_sheet("Overview", offset=-len(wb.sheetnames))
+    # Freeze the first column and the header rows so users can scroll big tables
+    sheet.freeze_panes = "B4"
 
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
 
 
-def render_excel_preview_html(facet_results, facet_cols, tab_axis_col,
-                              item_label, value_label, exclude_set,
-                              selected_tab_idx=0, preview_rows=5):
-    """Build an HTML mockup of the Excel structure for inline preview.
+def render_excel_preview_html(facet_results, facet_cols, item_label,
+                              value_label, exclude_set, preview_rows=10):
+    """Render the Excel pivot table as inline HTML for live preview.
 
-    Renders two things:
-      1. A faux "tab strip" along the top showing each sheet's name, with the
-         user-selected tab highlighted in Beauhurst purple. Lets the user
-         see at a glance how many tabs there will be and what they're called.
-      2. The contents of the selected tab, with each side-by-side block
-         rendered as a small table (block header in purple, then column
-         headers, then top-N rows of real data).
+    Same data layout as build_excel_workbook (single pivot table, items down
+    the left, facet values across the top, counts in cells). Shows the top
+    ``preview_rows`` items by total descending. Empty cells render as 0
+    matching the zero-fill default.
 
-    Returns the HTML string; the caller is responsible for wrapping it in
-    st.markdown(..., unsafe_allow_html=True). Cheap to call - all data is
-    already computed and cached in facet_results.
+    Returns the HTML string; caller wraps it in st.markdown(..., unsafe_allow_html=True).
     """
     import html as _html
 
     if not facet_results:
         return "<p style='color:#6B6B72'><em>No data to preview.</em></p>"
 
-    layout = _summarise_excel_layout(facet_results, facet_cols, tab_axis_col)
-    cell_data = _build_excel_cell_data(facet_results, facet_cols, tab_axis_col)
+    # Column headers (facet labels in natural sort order)
+    facet_labels = [entry[1] or "All" for entry in facet_results]
+    facet_labels = sorted(facet_labels, key=_natural_sort_key)
+    label_to_metric = {(entry[1] or "All"): entry[3] for entry in facet_results}
 
-    tabs = layout["tabs"]
-    blocks_by_tab = layout["blocks_by_tab"]
+    # Items: union minus exclusions, sorted by total descending
+    all_items = set()
+    for entry in facet_results:
+        all_items.update(entry[3].index)
+    all_items -= exclude_set
 
-    # Clamp the selected tab to the available range
-    selected_tab_idx = max(0, min(selected_tab_idx, len(tabs) - 1))
-    selected_tab = tabs[selected_tab_idx]
+    item_totals = {}
+    for item in all_items:
+        total = 0.0
+        for entry in facet_results:
+            metric = entry[3]
+            if item in metric.index:
+                v = metric[item]
+                if pd.notna(v):
+                    total += float(v)
+        item_totals[item] = total
+    sorted_items = sorted(all_items, key=lambda i: (-item_totals[i], str(i).lower()))
 
-    # === Tab strip ===
-    # Show up to ~12 tabs inline; if there are more, show an overflow indicator
-    visible_tab_limit = 12
-    visible_tabs = tabs[:visible_tab_limit]
-    overflow_count = max(0, len(tabs) - visible_tab_limit)
+    # Cap visible columns to keep preview readable (Excel still has all)
+    visible_col_limit = 12
+    visible_cols = facet_labels[:visible_col_limit]
+    cols_overflow = max(0, len(facet_labels) - len(visible_cols))
 
-    tab_strip_parts = ['<div style="margin-bottom:8px; padding-bottom:6px; '
-                       'border-bottom:2px solid #4B4897;">']
-    for i, t in enumerate(visible_tabs):
-        is_selected = (i == selected_tab_idx)
-        tab_strip_parts.append(
-            f'<span style="display:inline-block; padding:5px 12px; margin-right:3px; '
-            f'background:{"#4B4897" if is_selected else "#E8E6E0"}; '
-            f'color:{"#FFFFFF" if is_selected else "#1A1A1F"}; '
-            f'font-weight:{"600" if is_selected else "500"}; '
-            f'border-radius:4px 4px 0 0; font-size:12px; '
-            f'font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;">'
-            f'{_html.escape(str(t))}</span>'
-        )
-    if overflow_count > 0:
-        tab_strip_parts.append(
-            f'<span style="display:inline-block; padding:5px 10px; '
-            f'color:#6B6B72; font-size:11px; font-style:italic; '
-            f'font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;">'
-            f'+{overflow_count} more tab{"s" if overflow_count != 1 else ""}</span>'
-        )
-    tab_strip_parts.append('</div>')
+    # Cap visible rows
+    visible_items = sorted_items[:preview_rows]
+    rows_overflow = max(0, len(sorted_items) - len(visible_items))
 
-    # === Selected tab content (blocks side-by-side) ===
-    block_labels = blocks_by_tab.get(selected_tab, [])
-    # Cap blocks shown in preview to keep it scannable
-    visible_block_limit = 6
-    visible_blocks = block_labels[:visible_block_limit]
-    blocks_overflow = max(0, len(block_labels) - visible_block_limit)
-
-    content_parts = []
-    if not visible_blocks:
-        content_parts.append('<p style="color:#6B6B72"><em>No blocks in this tab.</em></p>')
-    else:
-        content_parts.append(
-            '<div style="overflow-x:auto; white-space:nowrap; '
-            'padding:8px; background:#FAF8F5; border:1px solid #D0CDC4; '
-            'border-radius:4px;">'
-        )
-        for block_label in visible_blocks:
-            metric, unknown = cell_data.get((selected_tab, block_label), (None, 0))
-            if metric is None:
-                continue
-            # Filter out excluded items so the preview matches what the Excel
-            # and the on-screen charts will contain
-            if exclude_set:
-                filtered_items = [(k, v) for k, v in metric.items() if k not in exclude_set]
-            else:
-                filtered_items = list(metric.items())
-            rows_html_parts = []
-            preview_items = filtered_items[:preview_rows]
-            for rank, (item, val) in enumerate(preview_items, start=1):
-                val_display = (f"{val:,.0f}" if pd.notna(val) and float(val).is_integer()
-                               else f"{val:,.2f}" if pd.notna(val) else "")
-                # Truncate long item names so the preview stays scannable
-                item_display = _html.escape(str(item))
-                if len(item_display) > 30:
-                    item_display = item_display[:28] + "…"
-                rows_html_parts.append(
-                    f'<tr>'
-                    f'<td style="text-align:right; padding:2px 8px; color:#6B6B72;">{rank}</td>'
-                    f'<td style="padding:2px 8px;">{item_display}</td>'
-                    f'<td style="text-align:right; padding:2px 8px; font-variant-numeric:tabular-nums;">{val_display}</td>'
-                    f'</tr>'
-                )
-            if unknown and unknown > 0:
-                rows_html_parts.append(
-                    f'<tr style="color:#6B6B72; font-style:italic;">'
-                    f'<td style="padding:2px 8px;"></td>'
-                    f'<td style="padding:2px 8px;">Unknown</td>'
-                    f'<td style="text-align:right; padding:2px 8px; font-variant-numeric:tabular-nums;">{unknown:,}</td>'
-                    f'</tr>'
-                )
-            more_rows = max(0, len(filtered_items) - preview_rows)
-            if more_rows > 0:
-                rows_html_parts.append(
-                    f'<tr style="color:#6B6B72; font-style:italic;">'
-                    f'<td colspan="3" style="padding:2px 8px;">+{more_rows} more row{"s" if more_rows != 1 else ""}</td>'
-                    f'</tr>'
-                )
-
-            content_parts.append(
-                f'<div style="display:inline-block; vertical-align:top; margin-right:12px; '
-                f'border:1px solid #D0CDC4; border-radius:3px; overflow:hidden; '
-                f'font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;">'
-                f'<div style="background:#4B4897; color:#FFFFFF; padding:5px 10px; '
-                f'font-weight:600; font-size:12px;">{_html.escape(str(block_label))}</div>'
-                f'<table style="border-collapse:collapse; font-size:11px; background:#FFFFFF;">'
-                f'<thead><tr style="background:#E8E6E0; font-weight:600;">'
-                f'<th style="padding:3px 8px; text-align:right;">#</th>'
-                f'<th style="padding:3px 8px; text-align:left;">{_html.escape(item_label)}</th>'
-                f'<th style="padding:3px 8px; text-align:right;">{_html.escape(value_label)}</th>'
-                f'</tr></thead>'
-                f'<tbody>{"".join(rows_html_parts)}</tbody>'
-                f'</table>'
-                f'</div>'
-            )
-        if blocks_overflow > 0:
-            content_parts.append(
-                f'<span style="display:inline-block; vertical-align:top; '
-                f'padding:30px 12px; color:#6B6B72; font-size:11px; '
-                f'font-style:italic; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;">'
-                f'+{blocks_overflow} more block{"s" if blocks_overflow != 1 else ""}<br>'
-                f'in this tab</span>'
-            )
-        content_parts.append('</div>')
-
-    return "".join(tab_strip_parts) + "".join(content_parts)
-
-
-@st.fragment
-def render_excel_section_fragment(facet_results, facet_cols_valid, chart_title,
-                                  item_label, value_label, exclude_set, filename_stem):
-    """Render the entire 'Build Excel' section as an isolated Streamlit fragment.
-
-    Wrapping in @st.fragment means widget interactions inside this function
-    (the tab-axis selectbox, the preview-tab selectbox, the confirmation
-    button) only re-run this function, not the entire app script. So toggling
-    the layout no longer triggers a full rerun - the on-screen charts and
-    sidebar above stay completely static.
-
-    The confirmation gate's `st.rerun()` also stays local: inside a fragment
-    it reruns only the fragment, which is exactly what we want.
-
-    All inputs come in as parameters - the fragment doesn't read locals from
-    the outer scope. session_state is used only for the confirmation token
-    and the preview-tab selection (both fragment-scoped concerns).
-    """
-    st.markdown("---")
-    st.markdown("### 📊 Build Excel")
-    st.caption(
-        "The Excel file contains a ranking for every combination of facet "
-        "values, organised into tabs. Choose the layout below — the preview "
-        "shows exactly what one sheet will look like when you open the file."
+    # Build the HTML table
+    parts = []
+    parts.append(
+        '<div style="overflow-x:auto; padding:8px; background:#FAF8F5; '
+        'border:1px solid #D0CDC4; border-radius:4px; '
+        'font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;">'
     )
-
-    # === Layout picker ===
-    picker_cols = st.columns([2, 2, 3])
-
-    with picker_cols[0]:
-        tab_options = ["(All in one tab)"] + list(facet_cols_valid)
-        default_idx = 1 if len(facet_cols_valid) >= 1 else 0
-        tab_axis_choice = st.selectbox(
-            "One tab per…",
-            tab_options,
-            index=default_idx,
-            key="excel_tab_axis",
-            help="Which facet column drives the Excel tabs. The remaining "
-                 "facet columns become side-by-side rankings within each tab.",
-        )
-        tab_axis_for_excel = (
-            None if tab_axis_choice == "(All in one tab)" else tab_axis_choice
-        )
-
-    # Compute layout summary (cheap)
-    layout_summary = _summarise_excel_layout(
-        facet_results, facet_cols_valid, tab_axis_for_excel
+    parts.append(
+        '<table style="border-collapse:collapse; font-size:11px; background:#FFFFFF;">'
     )
-    n_tabs = layout_summary["n_tabs"]
-    n_blocks = layout_summary["n_blocks"]
-    side_cols = layout_summary["side_cols"]
-    tabs_list = layout_summary["tabs"]
-
-    with picker_cols[1]:
-        preview_options = tabs_list if tabs_list else ["(none)"]
-        # Per-tab-axis widget key so the dropdown resets when tab axis changes
-        preview_key = f"excel_preview_tab_{tab_axis_choice}"
-        if preview_key not in st.session_state:
-            st.session_state[preview_key] = preview_options[0]
-        preview_tab_choice = st.selectbox(
-            "Preview tab",
-            preview_options,
-            key=preview_key,
-            help="Which Excel tab to render in the preview below. The "
-                 "Excel file will contain every tab, not just this one.",
-            disabled=(len(preview_options) <= 1 and preview_options[0] == "(none)"),
-        )
-
-    with picker_cols[2]:
-        st.markdown("&nbsp;", unsafe_allow_html=True)
-        summary_bits = [
-            f"**{n_tabs}** tab{'s' if n_tabs != 1 else ''}",
-            f"**{n_blocks}** ranking{'s' if n_blocks != 1 else ''} total",
-        ]
-        if side_cols:
-            summary_bits.append(f"side-by-side by **{', '.join(side_cols)}**")
-        st.caption("  ·  ".join(summary_bits))
-
-    # === Visual preview ===
-    try:
-        selected_tab_idx = (
-            tabs_list.index(preview_tab_choice) if preview_tab_choice in tabs_list else 0
-        )
-    except (ValueError, AttributeError):
-        selected_tab_idx = 0
-    preview_html = render_excel_preview_html(
-        facet_results, facet_cols_valid, tab_axis_for_excel,
-        item_label, value_label, exclude_set,
-        selected_tab_idx=selected_tab_idx, preview_rows=5,
+    # Header row
+    parts.append('<thead><tr>')
+    parts.append(
+        f'<th style="background:#4B4897; color:#FFFFFF; padding:6px 10px; '
+        f'text-align:left; font-weight:600; position:sticky; left:0;">'
+        f'{_html.escape(item_label)}</th>'
     )
-    st.markdown(preview_html, unsafe_allow_html=True)
-
-    # === Download button (with >30 confirmation gate) ===
-    workbook_args = (
-        facet_results, facet_cols_valid, tab_axis_for_excel,
-        item_label, value_label, exclude_set, chart_title,
-    )
-    # Confirmation token resets if the user changes anything that meaningfully
-    # affects the file (tab axis choice or total ranking count).
-    confirm_key = ("_excel_confirmed", n_blocks, tab_axis_for_excel)
-    excel_ready = (
-        n_blocks <= EXCEL_CONFIRM_THRESHOLD
-        or st.session_state.get("_excel_confirm_token") == confirm_key
-    )
-
-    if not excel_ready:
-        st.warning(
-            f"⚠️ This layout would produce **{n_blocks:,} rankings** across "
-            f"**{n_tabs:,} tab{'s' if n_tabs != 1 else ''}** — more than the "
-            f"{EXCEL_CONFIRM_THRESHOLD}-ranking comfort threshold. Building "
-            f"may take a few seconds. Confirm below if that's what you want."
+    for label in visible_cols:
+        parts.append(
+            f'<th style="background:#4B4897; color:#FFFFFF; padding:6px 10px; '
+            f'text-align:center; font-weight:600;">{_html.escape(str(label))}</th>'
         )
-        if st.button("✅ Yes, build the Excel file",
-                     key="confirm_excel",
-                     help="Marks this layout as confirmed and enables "
-                          "the download button. Confirmation resets if "
-                          "you change the tab axis or the data."):
-            st.session_state["_excel_confirm_token"] = confirm_key
-            st.rerun()  # fragment-scoped rerun: only this section re-renders
+    if cols_overflow > 0:
+        parts.append(
+            f'<th style="background:#E8E6E0; color:#6B6B72; padding:6px 10px; '
+            f'font-style:italic; font-weight:400;">+{cols_overflow} more</th>'
+        )
+    parts.append('</tr></thead>')
 
-    dl_cols = st.columns([2, 3])
-    with dl_cols[0]:
-        if excel_ready:
-            st.download_button(
-                "⬇️ Download Excel (.xlsx)",
-                data=lambda a=workbook_args: build_excel_workbook(*a),
-                file_name=f"{filename_stem}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary",
-                help=f"Multi-tab workbook with {n_tabs} tab(s) and {n_blocks} "
-                     f"ranking(s) total. Built when you click.",
-                use_container_width=True,
+    # Data rows
+    parts.append('<tbody>')
+    for item in visible_items:
+        item_display = _html.escape(str(item))
+        if len(item_display) > 36:
+            item_display = item_display[:34] + "…"
+        parts.append('<tr>')
+        parts.append(
+            f'<td style="padding:3px 10px; border-bottom:1px solid #E8E6E0; '
+            f'font-weight:500; background:#FFFFFF; position:sticky; left:0;">'
+            f'{item_display}</td>'
+        )
+        for label in visible_cols:
+            metric = label_to_metric.get(label)
+            val = 0.0
+            if metric is not None and item in metric.index:
+                v = metric[item]
+                if pd.notna(v):
+                    val = float(v)
+            val_display = f"{val:,.0f}" if val == int(val) else f"{val:,.2f}"
+            # Dim the cell if value is zero, so the eye picks up non-zeros
+            color = "#6B6B72" if val == 0 else "#1A1A1F"
+            parts.append(
+                f'<td style="padding:3px 10px; border-bottom:1px solid #E8E6E0; '
+                f'text-align:right; font-variant-numeric:tabular-nums; color:{color};">'
+                f'{val_display}</td>'
             )
-        else:
-            st.button(
-                "⬇️ Download Excel (.xlsx)",
-                disabled=True,
-                help="Click '✅ Yes, build the Excel file' above to enable.",
-                use_container_width=True,
+        if cols_overflow > 0:
+            parts.append(
+                '<td style="padding:3px 10px; border-bottom:1px solid #E8E6E0; '
+                'text-align:center; color:#6B6B72;">…</td>'
             )
-    with dl_cols[1]:
-        total_unknown = sum(u for _, _, _, _, u in facet_results)
-        if total_unknown > 0:
-            st.caption(
-                f"Excel includes per-group 'Unknown' rows ({total_unknown:,} "
-                f"row{'s' if total_unknown != 1 else ''} total without a value)."
-            )
-        if exclude_set:
-            st.caption(
-                f"Excluded from charts (also removed from Excel): "
-                f"{', '.join(sorted(exclude_set)[:3])}"
-                + (f", +{len(exclude_set) - 3} more" if len(exclude_set) > 3 else "")
-                + "."
-            )
+        parts.append('</tr>')
+
+    if rows_overflow > 0:
+        parts.append(
+            f'<tr><td colspan="{len(visible_cols) + 1 + (1 if cols_overflow else 0)}" '
+            f'style="padding:6px 10px; color:#6B6B72; font-style:italic; '
+            f'background:#FAF8F5;">+{rows_overflow} more row{"s" if rows_overflow != 1 else ""}'
+            f' in the Excel</td></tr>'
+        )
+    parts.append('</tbody></table></div>')
+
+    return "".join(parts)
 
 
 def _render_filter_editor_body(df, current_source):
@@ -3035,11 +2816,19 @@ if uploaded_file:
         # render time. Most multi-ranking use cases head straight to the
         # Excel export and never look at the on-page charts; default to off
         # for faceted output and on for single-ranking.
-        _default_show_charts = not bool(facet_cols_valid)
+        #
+        # We deliberately use DIFFERENT widget keys for the two modes so each
+        # mode preserves its own toggle state independently. With a single
+        # shared key, Streamlit would keep the value the user last set, so
+        # toggling charts on for single-ranking would stick when they then
+        # switch to multi-ranking (defeating the "off by default" intent).
+        _is_multi = bool(facet_cols_valid)
+        _default_show_charts = not _is_multi
+        _toggle_key = "view_show_charts_multi" if _is_multi else "view_show_charts_single"
         show_charts = st.checkbox(
             "Show charts on page",
             value=_default_show_charts,
-            key="view_show_charts",
+            key=_toggle_key,
             help="Off by default for multi-ranking (charts are rarely needed; "
                  "the Excel preview at the top of the page is the main output). "
                  "Turn on to see one bar chart per group rendered below. The "
@@ -3151,7 +2940,7 @@ if uploaded_file:
             st.session_state.get("_filename_stem")
             or safe_filename(chart_title)
         )
-        with st.expander("📊 Build Excel — preview & download", expanded=False):
+        with st.expander("📊 Build Excel — preview & download", expanded=True):
             render_excel_section_fragment(
                 facet_results=facet_results,
                 facet_cols_valid=facet_cols_valid,
