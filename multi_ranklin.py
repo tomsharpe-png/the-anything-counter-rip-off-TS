@@ -2004,6 +2004,103 @@ def render_excel_preview_html(facet_results, facet_cols, item_label,
     return "".join(parts)
 
 
+@st.fragment
+def render_excel_section_fragment(facet_results, facet_cols_valid, chart_title,
+                                  item_label, value_label, exclude_set, filename_stem):
+    """Render the Excel preview + download as an isolated Streamlit fragment.
+
+    Wrapping in @st.fragment means widget changes inside (the confirmation
+    button) only re-run this function, not the entire app script. So toggling
+    here doesn't trigger a full rerun above.
+
+    Layout is fixed: single-tab pivot table. No tab axis selector — every
+    facet group becomes a column, every item becomes a row, every cell is
+    the count for that combination (0 where missing).
+    """
+    st.caption(
+        "The Excel file is a pivot table — every industry as a row, every "
+        "facet value as a column, counts (with 0 where missing) in the cells. "
+        "All on one sheet, ready to download."
+    )
+
+    # Summary line: rows × columns
+    n_columns = sum(1 for _ in facet_results)  # one column per facet group
+    # Count items (union minus exclusions)
+    all_items = set()
+    for entry in facet_results:
+        all_items.update(entry[3].index)
+    all_items -= exclude_set
+    n_items = len(all_items)
+    st.caption(
+        f"**{n_items:,}** item{'s' if n_items != 1 else ''} × "
+        f"**{n_columns:,}** column{'s' if n_columns != 1 else ''} "
+        f"({n_items * n_columns:,} cell{'s' if n_items * n_columns != 1 else ''} total)"
+    )
+
+    # Visual preview
+    preview_html = render_excel_preview_html(
+        facet_results, facet_cols_valid, item_label, value_label, exclude_set,
+        preview_rows=10,
+    )
+    st.markdown(preview_html, unsafe_allow_html=True)
+
+    # Download. Confirmation gate kicks in only above the threshold based on
+    # the total cell count (rows × cols), since that's the actual size of
+    # the workbook.
+    workbook_args = (
+        facet_results, facet_cols_valid,
+        item_label, value_label, exclude_set, chart_title,
+    )
+    n_cells = n_items * n_columns
+    confirm_key = ("_excel_confirmed", n_cells)
+    excel_ready = (
+        n_cells <= EXCEL_CONFIRM_THRESHOLD * 30  # 30 facets × 30 items = 900 cells default
+        or st.session_state.get("_excel_confirm_token") == confirm_key
+    )
+
+    if not excel_ready:
+        st.warning(
+            f"⚠️ This pivot would have **{n_cells:,} cells** "
+            f"(**{n_items:,}** items × **{n_columns:,}** columns). "
+            f"Building may take a few seconds. Confirm below if that's "
+            f"what you want."
+        )
+        if st.button("✅ Yes, build the Excel file",
+                     key="confirm_excel",
+                     help="Confirmation resets if the data changes."):
+            st.session_state["_excel_confirm_token"] = confirm_key
+            st.rerun()
+
+    dl_cols = st.columns([2, 3])
+    with dl_cols[0]:
+        if excel_ready:
+            st.download_button(
+                "⬇️ Download Excel (.xlsx)",
+                data=lambda a=workbook_args: build_excel_workbook(*a),
+                file_name=f"{filename_stem}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+                help=f"Single-tab pivot table: {n_items} items × {n_columns} columns. "
+                     f"Built when you click.",
+                use_container_width=True,
+            )
+        else:
+            st.button(
+                "⬇️ Download Excel (.xlsx)",
+                disabled=True,
+                help="Click '✅ Yes, build the Excel file' above to enable.",
+                use_container_width=True,
+            )
+    with dl_cols[1]:
+        if exclude_set:
+            st.caption(
+                f"Excluded from pivot: "
+                f"{', '.join(sorted(exclude_set)[:3])}"
+                + (f", +{len(exclude_set) - 3} more" if len(exclude_set) > 3 else "")
+                + "."
+            )
+
+
 def _render_filter_editor_body(df, current_source):
     """Render the Raw Data Filters UI.
 
