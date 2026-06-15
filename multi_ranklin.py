@@ -558,9 +558,17 @@ def _add_date_derivations(df):
     'Q1 2025' (so the natural-sort key can re-order chronologically across
     year boundaries: 'Q4 2024' < 'Q1 2025').
 
+    Placement matters: derived columns are inserted IMMEDIATELY after their
+    source column rather than appended to the end. So if a file has multiple
+    date columns ('Deal date', 'Funding date', 'Closure date'), each gets its
+    own (Year)/(Quarter) pair grouped with it - making the filter and facet
+    pickers easy to scan. With end-appending, the derivations would all pile
+    up at the bottom of the column list, divorced from their sources.
+
     Idempotent and conservative: already-derived columns are skipped; columns
     where the derived name would collide with existing data are skipped.
     """
+    # Snapshot the original columns so we don't iterate over our own insertions
     for col in list(df.columns):
         if not isinstance(col, str):
             continue
@@ -577,15 +585,23 @@ def _add_date_derivations(df):
         year_col = f"{col} (Year)"
         quarter_col = f"{col} (Quarter)"
 
+        # df.columns.get_loc gives the CURRENT position of `col` (which may
+        # have shifted right if earlier date columns added their derivations).
+        # We insert immediately after it; insert_at advances as we add.
+        insert_at = df.columns.get_loc(col) + 1
+
         if year_col not in df.columns:
-            df[year_col] = dates.dt.year.apply(
+            year_values = dates.dt.year.apply(
                 lambda y: str(int(y)) if pd.notna(y) else ""
             )
+            df.insert(insert_at, year_col, year_values)
+            insert_at += 1
         if quarter_col not in df.columns:
-            df[quarter_col] = [
+            quarter_values = [
                 f"Q{int(q)} {int(y)}" if pd.notna(q) and pd.notna(y) else ""
                 for q, y in zip(dates.dt.quarter, dates.dt.year)
             ]
+            df.insert(insert_at, quarter_col, quarter_values)
 
 
 @st.cache_data
