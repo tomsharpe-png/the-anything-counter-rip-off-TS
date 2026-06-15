@@ -573,12 +573,20 @@ def _parse_dates_best(col_series):
     Same best-of-both logic as _is_date_column: ISO 8601 prefers default
     parsing; UK DD/MM/YYYY prefers dayfirst=True. We try both and keep the
     one that produces more valid Timestamps.
+
+    Tie-breaking: when both strategies produce the same count of valid
+    timestamps (the most common situation in practice — ambiguous strings
+    like '08/01/2016' parse cleanly under EITHER interpretation, yielding
+    a tie), we pick the dayfirst (UK) result. Beauhurst exports are
+    UK-formatted, so the UK reading is the correct one when both are valid.
+    Default parsing only wins when it produces STRICTLY MORE valid values,
+    which happens for ISO 8601 strings (where dayfirst mis-parses them).
     """
     if pd.api.types.is_datetime64_any_dtype(col_series):
         return col_series
     p1 = pd.to_datetime(col_series, errors="coerce")
     p2 = pd.to_datetime(col_series, errors="coerce", dayfirst=True)
-    return p1 if p1.notna().sum() >= p2.notna().sum() else p2
+    return p1 if p1.notna().sum() > p2.notna().sum() else p2
 
 
 def _add_date_derivations(df):
