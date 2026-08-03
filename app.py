@@ -572,7 +572,17 @@ def process_industry_buzzword(df_active, layout, amount_choice=None):
             amts = pd.to_numeric(df_active[amount_choice], errors="coerce").fillna(0).values
             for c in cols:
                 series_of_lists, exploded = _explode_smart(df_active, c)
-                lengths = series_of_lists.apply(len).values
+                # .explode() emits one NaN row for each empty list, so the
+                # exploded series length is `sum(len(list)) + count(empty)`.
+                # Using apply(len) here directly would undercount empties (they
+                # each return 0) and make np.repeat produce a shorter vector
+                # than exploded.values, causing "All arrays must be of the same
+                # length" on the DataFrame construction below. Treat empty
+                # lists as length 1 so the repeats align with .explode()'s
+                # NaN placeholder rows. Those NaN slots get filtered on the
+                # next line by the .notna() check, so the padding amount
+                # never leaks into the final result.
+                lengths = series_of_lists.apply(lambda x: max(len(x), 1)).values
                 repeated_amts = np.repeat(amts, lengths)
                 exploded = exploded.reset_index(drop=True)
                 df_pair = pd.DataFrame({"item": exploded.values, "amt": repeated_amts})
@@ -1664,7 +1674,7 @@ if uploaded_file:
         render_filter_editor(df, current_source)
 
         st.markdown('<div class="apply-btn">', unsafe_allow_html=True)
-        apply_trigger = st.button("🚀 APPLY CHANGES", use_container_width=True)
+        apply_trigger = st.button("🚀 APPLY CHANGES", width="stretch")
         st.markdown('</div>', unsafe_allow_html=True)
 
     # Filtering Execution
@@ -2003,7 +2013,7 @@ if uploaded_file:
             (rank_mode == "Highest first"),
             "money" if is_money else "count",
         )
-        st.image(png_display, use_container_width=True)
+        st.image(png_display, width="stretch")
 
         with st.sidebar:
             st.markdown("---")
