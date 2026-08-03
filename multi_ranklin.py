@@ -69,7 +69,7 @@ BEAUHURST_INDUSTRIES = [
     'Application software',
     'Architecture',
     'Arts and crafts',
-    'Assistants, secretaries and administrative support',
+    'Assistants',
     'Auctioneering',
     'Automotive dealerships',
     'Baked goods',
@@ -82,7 +82,7 @@ BEAUHURST_INDUSTRIES = [
     'Books, comics and graphic novels',
     'Budgeting and financial management',
     'Building materials, tools and accessories',
-    'Butchers, fishmongers and greengrocers',
+    'Butchers',
     'Care homes',
     'Cars, motorcycles and other road vehicles',
     'Catering',
@@ -98,7 +98,7 @@ BEAUHURST_INDUSTRIES = [
     'Collection and delivery',
     'Condiments and seasonings',
     'Confectionery and snacks',
-    'Corner shops, news agents, off-licences and petrol stations',
+    'Corner shops',
     'Courses and educational material',
     'Credit ratings and scores',
     'Currency exchange',
@@ -125,7 +125,7 @@ BEAUHURST_INDUSTRIES = [
     'Fabrics and textiles',
     'Festivals, conferences, exhibitions and fairs',
     'Films and TV',
-    'Fish, meat and eggs',
+    'Fish',
     'Fishing and aquafarming',
     'Flowers, trees and other plants',
     'Food and drink processing',
@@ -136,7 +136,7 @@ BEAUHURST_INDUSTRIES = [
     'Furniture, furnishings and fixtures',
     'Gardening, landscaping and tree surgery',
     'Gemstones and precious metals',
-    'Gifts, cards and stationery',
+    'Gifts',
     'Glass',
     'Graphic design',
     'Gyms and spas',
@@ -155,13 +155,13 @@ BEAUHURST_INDUSTRIES = [
     'Interior design',
     'Investment banking and corporate finance',
     'Jewellery and other accessories',
-    'Land, water and air management',
+    'Land',
     'Languages, translation and interpretation',
     'Lead generation and sales support',
     'Legal services',
     'Lighting',
     'Livestock and equine',
-    'Loans, debt and grants',
+    'Loans',
     'Management and strategy consultancy',
     'Manufacturing',
     'Market research',
@@ -173,15 +173,15 @@ BEAUHURST_INDUSTRIES = [
     'Meetups and social clubs',
     'Mental well-being',
     'Military and defence',
-    'Mining, boring and drilling',
+    'Mining',
     'Mobile and temporary accommodation',
     'Mobile, internet and wireless hardware',
     'Music',
-    'Music venues, galleries, theatres and museums',
+    'Music venues',
     'Newspapers, magazines and online publishing',
     'Nightclubs and bars',
     'Non-alcoholic beverages',
-    'Non-precious metals, steel and other alloys',
+    'Non-precious metals',
     'Nurseries',
     'Office space',
     'Oil and gas',
@@ -191,10 +191,10 @@ BEAUHURST_INDUSTRIES = [
     'Packaging and printing',
     'Painting, sculpture and other artworks',
     'Parking',
-    'Parks, zoos and farm attractions',
+    'Parks',
     'Parts and components',
     'Passenger airlines',
-    'Pasta, rice and other dry processed foods',
+    'Pasta',
     'Payment processing',
     'Performance art',
     'Personnel supply and contract outsourcing',
@@ -223,7 +223,7 @@ BEAUHURST_INDUSTRIES = [
     'Public relations',
     'Radio series, podcasts, audio books and other audio content',
     'Ready meals and meal kits',
-    'Recruitment, headhunting and talent management',
+    'Recruitment',
     'Renewable energy',
     'Repair, maintenance and servicing',
     'Research tools and reagents',
@@ -276,6 +276,21 @@ BEAUHURST_INDUSTRIES = [
     'Wealth, asset and investment management',
     'Website hosting',
     'Weddings',
+    'boring and drilling',
+    'cards and stationery',
+    'debt and grants',
+    'fishmongers and greengrocers',
+    'galleries',
+    'headhunting and talent management',
+    'meat and eggs',
+    'news agents',
+    'off-licences and petrol stations',
+    'rice and other dry processed foods',
+    'secretaries and administrative support',
+    'steel and other alloys',
+    'theatres and museums',
+    'water and air management',
+    'zoos and farm attractions',
 ]
 
 BEAUHURST_BUZZWORDS = [
@@ -739,7 +754,17 @@ def process_industry_buzzword(df_active, layout, amount_choice=None):
             amts = pd.to_numeric(df_active[amount_choice], errors="coerce").fillna(0).values
             for c in cols:
                 series_of_lists, exploded = _explode_smart(df_active, c)
-                lengths = series_of_lists.apply(len).values
+                # .explode() emits one NaN row for each empty list, so the
+                # exploded series length is `sum(len(list)) + count(empty)`.
+                # Using apply(len) here directly would undercount empties (they
+                # each return 0) and make np.repeat produce a shorter vector
+                # than exploded.values, causing "All arrays must be of the same
+                # length" on the DataFrame construction below. Treat empty
+                # lists as length 1 so the repeats align with .explode()'s
+                # NaN placeholder rows. Those NaN slots get filtered on the
+                # next line by the .notna() check, so the padding amount
+                # never leaks into the final result.
+                lengths = series_of_lists.apply(lambda x: max(len(x), 1)).values
                 repeated_amts = np.repeat(amts, lengths)
                 exploded = exploded.reset_index(drop=True)
                 df_pair = pd.DataFrame({"item": exploded.values, "amt": repeated_amts})
@@ -2045,7 +2070,7 @@ def render_excel_section_fragment(facet_results, facet_cols_valid, chart_title,
             type="primary",
             help=f"Single-tab pivot table: {n_items} items × {n_columns} columns. "
                  f"Built when you click.",
-            use_container_width=True,
+            width="stretch",
         )
     with dl_cols[1]:
         if exclude_set:
@@ -2511,7 +2536,7 @@ if uploaded_file:
         render_filter_editor(df, current_source)
 
         st.markdown('<div class="apply-btn">', unsafe_allow_html=True)
-        apply_trigger = st.button("🚀 APPLY CHANGES", use_container_width=True)
+        apply_trigger = st.button("🚀 APPLY CHANGES", width="stretch")
         st.markdown('</div>', unsafe_allow_html=True)
 
     # Filtering Execution
@@ -3053,7 +3078,7 @@ if uploaded_file:
                     (rank_mode == "Highest first"),
                     fmt_kind,
                 )
-                st.image(png_display, use_container_width=True)
+                st.image(png_display, width="stretch")
         else:
             # Charts hidden - give the user a hint about where to turn them on
             n_groups_displayed = min(len(facet_results), MAX_FACET_DISPLAY)
