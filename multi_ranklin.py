@@ -1487,14 +1487,27 @@ def _compute_metric_for_subset(df_subset, mode, **kwargs):
         beauhurst_aware = kwargs.get("beauhurst_aware", False)
         if analysis_type == "Sum":
             sum_values = pd.to_numeric(df_subset[sum_col], errors="coerce")
-            metric = sum_values.groupby(df_subset[target_col]).sum()
+            # Normalise group keys to display strings. The ranked column can
+            # contain a MIX of types (ints, floats, times, text - common when
+            # Excel misparses inconsistently-formatted cells), and mixed raw
+            # objects crash any ordering operation downstream with
+            # "'<' not supported between instances of ...". The categories
+            # are only ever used as labels, so stringify them here at the
+            # source. display_series also cleans float artefacts ('2024.0'
+            # -> '2024') and renders timestamps as ISO dates. Blank/NaN keys
+            # are excluded - they're reported via the 'Unknown' count instead.
+            keys = display_series(df_subset[target_col])
+            valid = keys != ""
+            metric = sum_values[valid].groupby(keys[valid], sort=False).sum()
         else:
             if explode_enabled:
                 metric = process_generic_explode(
                     df_subset, target_col, use_smart_split=beauhurst_aware
                 )
             else:
-                metric = df_subset[target_col].value_counts()
+                # Same string normalisation as the Sum path (see above).
+                keys = display_series(df_subset[target_col])
+                metric = keys[keys != ""].value_counts()
     return metric.sort_values(ascending=False)
 
 
@@ -2064,7 +2077,7 @@ def render_excel_section_fragment(facet_results, facet_cols_valid, chart_title,
         if exclude_set:
             st.caption(
                 f"Excluded from pivot: "
-                f"{', '.join(sorted(exclude_set)[:3])}"
+                f"{', '.join(str(x) for x in sorted(exclude_set, key=str)[:3])}"
                 + (f", +{len(exclude_set) - 3} more" if len(exclude_set) > 3 else "")
                 + "."
             )
