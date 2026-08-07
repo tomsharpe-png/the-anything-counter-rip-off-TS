@@ -69,7 +69,7 @@ BEAUHURST_INDUSTRIES = [
     'Application software',
     'Architecture',
     'Arts and crafts',
-    'Assistants',
+    'Assistants, secretaries and administrative support',
     'Auctioneering',
     'Automotive dealerships',
     'Baked goods',
@@ -82,7 +82,7 @@ BEAUHURST_INDUSTRIES = [
     'Books, comics and graphic novels',
     'Budgeting and financial management',
     'Building materials, tools and accessories',
-    'Butchers',
+    'Butchers, fishmongers and greengrocers',
     'Care homes',
     'Cars, motorcycles and other road vehicles',
     'Catering',
@@ -98,7 +98,7 @@ BEAUHURST_INDUSTRIES = [
     'Collection and delivery',
     'Condiments and seasonings',
     'Confectionery and snacks',
-    'Corner shops',
+    'Corner shops, news agents, off-licences and petrol stations',
     'Courses and educational material',
     'Credit ratings and scores',
     'Currency exchange',
@@ -125,7 +125,7 @@ BEAUHURST_INDUSTRIES = [
     'Fabrics and textiles',
     'Festivals, conferences, exhibitions and fairs',
     'Films and TV',
-    'Fish',
+    'Fish, meat and eggs',
     'Fishing and aquafarming',
     'Flowers, trees and other plants',
     'Food and drink processing',
@@ -136,7 +136,7 @@ BEAUHURST_INDUSTRIES = [
     'Furniture, furnishings and fixtures',
     'Gardening, landscaping and tree surgery',
     'Gemstones and precious metals',
-    'Gifts',
+    'Gifts, cards and stationery',
     'Glass',
     'Graphic design',
     'Gyms and spas',
@@ -155,13 +155,13 @@ BEAUHURST_INDUSTRIES = [
     'Interior design',
     'Investment banking and corporate finance',
     'Jewellery and other accessories',
-    'Land',
+    'Land, water and air management',
     'Languages, translation and interpretation',
     'Lead generation and sales support',
     'Legal services',
     'Lighting',
     'Livestock and equine',
-    'Loans',
+    'Loans, debt and grants',
     'Management and strategy consultancy',
     'Manufacturing',
     'Market research',
@@ -173,15 +173,15 @@ BEAUHURST_INDUSTRIES = [
     'Meetups and social clubs',
     'Mental well-being',
     'Military and defence',
-    'Mining',
+    'Mining, boring and drilling',
     'Mobile and temporary accommodation',
     'Mobile, internet and wireless hardware',
     'Music',
-    'Music venues',
+    'Music venues, galleries, theatres and museums',
     'Newspapers, magazines and online publishing',
     'Nightclubs and bars',
     'Non-alcoholic beverages',
-    'Non-precious metals',
+    'Non-precious metals, steel and other alloys',
     'Nurseries',
     'Office space',
     'Oil and gas',
@@ -191,10 +191,10 @@ BEAUHURST_INDUSTRIES = [
     'Packaging and printing',
     'Painting, sculpture and other artworks',
     'Parking',
-    'Parks',
+    'Parks, zoos and farm attractions',
     'Parts and components',
     'Passenger airlines',
-    'Pasta',
+    'Pasta, rice and other dry processed foods',
     'Payment processing',
     'Performance art',
     'Personnel supply and contract outsourcing',
@@ -223,7 +223,7 @@ BEAUHURST_INDUSTRIES = [
     'Public relations',
     'Radio series, podcasts, audio books and other audio content',
     'Ready meals and meal kits',
-    'Recruitment',
+    'Recruitment, headhunting and talent management',
     'Renewable energy',
     'Repair, maintenance and servicing',
     'Research tools and reagents',
@@ -276,21 +276,6 @@ BEAUHURST_INDUSTRIES = [
     'Wealth, asset and investment management',
     'Website hosting',
     'Weddings',
-    'boring and drilling',
-    'cards and stationery',
-    'debt and grants',
-    'fishmongers and greengrocers',
-    'galleries',
-    'headhunting and talent management',
-    'meat and eggs',
-    'news agents',
-    'off-licences and petrol stations',
-    'rice and other dry processed foods',
-    'secretaries and administrative support',
-    'steel and other alloys',
-    'theatres and museums',
-    'water and air management',
-    'zoos and farm attractions',
 ]
 
 BEAUHURST_BUZZWORDS = [
@@ -688,26 +673,35 @@ def _add_date_derivations(df):
     return derived_from
 
 
-@st.cache_data
+@st.cache_data(max_entries=2, show_spinner="Loading data…")
 def load_data(file, sheet_name=None):
+    # MEMORY: max_entries=2 keeps only the current sheet (plus one previous,
+    # so quick back-and-forth sheet switches stay instant) instead of caching
+    # every file/sheet ever loaded in the session forever.
     ext = os.path.splitext(file.name)[1].lower()
     if ext in [".xlsx", ".xls"]:
         engine = "openpyxl" if ext == ".xlsx" else "xlrd"
-        if sheet_name is None:
-            # Defensive: pd.read_excel(..., sheet_name=None) returns a dict of all
-            # sheets, which would break every df.columns call downstream. Read the
-            # first non-empty sheet instead.
-            all_sheets = pd.read_excel(file, sheet_name=None, engine=engine)
-            for name, sheet_df in all_sheets.items():
-                if not sheet_df.empty:
-                    return _clean_columns(sheet_df)
-            # All sheets empty - return the first one anyway so we have a frame
-            return _clean_columns(next(iter(all_sheets.values())))
-        return _clean_columns(pd.read_excel(file, sheet_name=sheet_name, engine=engine))
+        # MEMORY: read ONLY the requested sheet. sheet_name=None previously
+        # parsed the ENTIRE workbook (every sheet materialised as a DataFrame)
+        # just to pick the first one - reading sheet 0 directly gets the same
+        # result without ever holding the other sheets in RAM.
+        target = 0 if sheet_name is None else sheet_name
+        return _clean_columns(pd.read_excel(file, sheet_name=target, engine=engine))
     try:
         return _clean_columns(pd.read_csv(file))
     except Exception:
         return _clean_columns(pd.read_csv(file, encoding="latin-1"))
+
+
+@st.cache_data(max_entries=2)
+def get_sheet_names(file):
+    """List sheet names without keeping the parsed workbook alive.
+
+    The sidebar previously did pd.ExcelFile(uploaded_file) on EVERY rerun,
+    re-parsing the workbook each time just to populate the sheet dropdown.
+    Cached here so the names are read once per file.
+    """
+    return pd.ExcelFile(file).sheet_names
 
 
 def _explode_smart(df_in, col):
@@ -720,7 +714,11 @@ def _explode_smart(df_in, col):
     return series_of_lists, exploded
 
 
-@st.cache_data
+# MEMORY: no @st.cache_data here. Results are already memoised via the
+# session-state _facet_cache_key mechanism downstream; Streamlit's cache
+# would additionally pickle and retain a copy of every result (keyed by a
+# full hash of each facet sub-frame) with no eviction, and pay a DataFrame
+# hash on every call.
 def process_industry_buzzword(df_active, layout, amount_choice=None):
     if layout["mode"] == "single":
         pieces_count = []
@@ -754,17 +752,7 @@ def process_industry_buzzword(df_active, layout, amount_choice=None):
             amts = pd.to_numeric(df_active[amount_choice], errors="coerce").fillna(0).values
             for c in cols:
                 series_of_lists, exploded = _explode_smart(df_active, c)
-                # .explode() emits one NaN row for each empty list, so the
-                # exploded series length is `sum(len(list)) + count(empty)`.
-                # Using apply(len) here directly would undercount empties (they
-                # each return 0) and make np.repeat produce a shorter vector
-                # than exploded.values, causing "All arrays must be of the same
-                # length" on the DataFrame construction below. Treat empty
-                # lists as length 1 so the repeats align with .explode()'s
-                # NaN placeholder rows. Those NaN slots get filtered on the
-                # next line by the .notna() check, so the padding amount
-                # never leaks into the final result.
-                lengths = series_of_lists.apply(lambda x: max(len(x), 1)).values
+                lengths = series_of_lists.apply(len).values
                 repeated_amts = np.repeat(amts, lengths)
                 exploded = exploded.reset_index(drop=True)
                 df_pair = pd.DataFrame({"item": exploded.values, "amt": repeated_amts})
@@ -817,7 +805,7 @@ def process_industry_buzzword(df_active, layout, amount_choice=None):
         return M.sum().astype(int)
 
 
-@st.cache_data
+# MEMORY: no @st.cache_data here - same reasoning as process_industry_buzzword.
 def process_generic_explode(df_active, target_col, use_smart_split=False):
     """Split and count separator-separated strings in a generic column.
 
@@ -1537,7 +1525,7 @@ def build_faceted_csv(facet_results, exclude_set, item_label, value_label):
     to get the side-by-side Full/Chart layout the user is used to.
     """
     rows = []
-    for _facet_key, facet_label, sub_df, metric, unknown_count in facet_results:
+    for _facet_key, facet_label, _n_rows, metric, unknown_count in facet_results:
         group_label = facet_label if facet_label is not None else ""
         for rank, (item, val) in enumerate(metric.items(), start=1):
             rows.append({
@@ -1573,7 +1561,7 @@ def build_chart_zip(facet_results, exclude_set, top_n, rank_mode, base_title,
     import zipfile
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for _facet_key, facet_label, sub_df, metric, unknown_count in facet_results:
+        for _facet_key, facet_label, _n_rows, metric, unknown_count in facet_results:
             # Slice to chart shape (same logic as the inline display loop)
             chart_series = metric.drop(
                 [k for k in metric.index if k in exclude_set], errors="ignore"
@@ -1666,7 +1654,7 @@ def _build_excel_cell_data(facet_results, facet_cols, tab_axis_col):
     cell_data = {}
     if not facet_cols:
         # Degenerate single-ranking case
-        _fkey, _lbl, _sub, metric, unknown = facet_results[0]
+        _fkey, _lbl, _n_rows, metric, unknown = facet_results[0]
         cell_data[("All", "All")] = (metric, unknown)
         return cell_data
 
@@ -2070,7 +2058,7 @@ def render_excel_section_fragment(facet_results, facet_cols_valid, chart_title,
             type="primary",
             help=f"Single-tab pivot table: {n_items} items × {n_columns} columns. "
                  f"Built when you click.",
-            width="stretch",
+            use_container_width=True,
         )
     with dl_cols[1]:
         if exclude_set:
@@ -2387,8 +2375,7 @@ with st.sidebar:
     uploaded_file = st.file_uploader("Upload File", type=["csv", "xlsx", "xls"])
     sheet_name = None
     if uploaded_file and os.path.splitext(uploaded_file.name)[1].lower() in [".xlsx", ".xls"]:
-        xls = pd.ExcelFile(uploaded_file)
-        sheet_name = st.selectbox("Select sheet:", xls.sheet_names)
+        sheet_name = st.selectbox("Select sheet:", get_sheet_names(uploaded_file))
 
 if uploaded_file:
     df = load_data(uploaded_file, sheet_name)
@@ -2462,6 +2449,10 @@ if uploaded_file:
         if mode == "No":
             analysis_type = st.radio("Analysis Type:", ["Count", "Sum"], horizontal=True)
             target_col = st.selectbox("Select Column to Rank", df.columns)
+            # sum_col is only chosen in Sum mode, but downstream code
+            # (metric_kwargs, _facet_cache_key) references it unconditionally
+            # - default it here so it always exists on every rerun.
+            sum_col = None
             explode_enabled = st.checkbox(
                 "Explode comma-separated values",
                 help="Split values like 'Apple, Orange' into separate counts"
@@ -2536,7 +2527,7 @@ if uploaded_file:
         render_filter_editor(df, current_source)
 
         st.markdown('<div class="apply-btn">', unsafe_allow_html=True)
-        apply_trigger = st.button("🚀 APPLY CHANGES", width="stretch")
+        apply_trigger = st.button("🚀 APPLY CHANGES", use_container_width=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
     # Filtering Execution
@@ -2547,15 +2538,22 @@ if uploaded_file:
     chosen_status_col = st.session_state.get("_active_col_state", None)
 
     if apply_trigger or source_changed or 'df_active' not in st.session_state:
-        df_active = df.copy()
-        # One-click Active filter (applied before the manual rule list so
-        # subsequent rules operate on the already-narrowed view).
-        if active_only and chosen_status_col and chosen_status_col in df_active.columns:
-            status_lower = df_active[chosen_status_col].astype(str).str.strip().str.lower()
-            df_active = df_active[status_lower.isin(_ACTIVE_STATUSES)]
+        # MEMORY: build ONE combined boolean mask against df instead of
+        # copying df and repeatedly slicing it. Sequential Include/Exclude
+        # filtering is exactly equivalent to AND-ing the per-rule masks, and
+        # this avoids the up-front df.copy() (a full duplicate of the data)
+        # plus an intermediate frame per rule. When nothing is filtered,
+        # df_active is just a reference to the cached df - zero extra RAM.
+        keep = pd.Series(True, index=df.index)
+
+        # One-click Active filter (combined with the manual rules via AND).
+        if active_only and chosen_status_col and chosen_status_col in df.columns:
+            status_lower = df[chosen_status_col].astype(str).str.strip().str.lower()
+            keep &= status_lower.isin(_ACTIVE_STATUSES)
+
         for rule in st.session_state.rules:
             col = rule.get('col')
-            if col not in df_active.columns:
+            if col not in df.columns:
                 continue
             kind = rule.get('kind', 'Values')
             mask = None
@@ -2575,7 +2573,7 @@ if uploaded_file:
                     # post-2262), including historical data back to year 1 AD.
                     # ISO 8601 dates with zero-padded years sort lexicographically
                     # the same way they sort chronologically.
-                    col_vals = to_iso_date_series(df_active[col])
+                    col_vals = to_iso_date_series(df[col])
                     # n1/n2 are already ISO strings from the date_input.isoformat()
                     # call, but normalise via _parse_to_iso_date in case they came
                     # from older session state in a different form.
@@ -2589,7 +2587,7 @@ if uploaded_file:
                     # We use the empty string which sorts before any real date.
                     col_vals = col_vals.fillna("")
                 else:
-                    col_vals = pd.to_numeric(df_active[col], errors="coerce")
+                    col_vals = pd.to_numeric(df[col], errors="coerce")
                     v1, v2 = n1, n2
 
                 if op == "=":
@@ -2620,12 +2618,15 @@ if uploaded_file:
                 # selecting "2024" matches both the float 2024.0 and the string "2024".
                 if not rule.get('vals'):
                     continue
-                is_year = is_year_column(col, df_active[col])
-                disp = display_series(df_active[col], is_year=is_year)
+                is_year = is_year_column(col, df[col])
+                disp = display_series(df[col], is_year=is_year)
                 mask = disp.isin(rule['vals'])
 
             if mask is not None:
-                df_active = df_active[mask] if rule.get('mode', 'Include') == "Include" else df_active[~mask]
+                keep &= mask if rule.get('mode', 'Include') == "Include" else ~mask
+
+        # Only materialise a filtered copy when rows are actually dropped.
+        df_active = df if bool(keep.all()) else df[keep]
         st.session_state.df_active = df_active
         # Bump a cheap integer cache key. Used downstream to gate metric_series
         # recomputation - avoids the ~30ms DataFrame hash that @st.cache_data
@@ -2814,7 +2815,7 @@ if uploaded_file:
         facet_results = st.session_state["_facet_results"]
     else:
         # Compute fresh. Each entry in facet_results is now a 5-tuple:
-        #   (facet_key_tuple, facet_label_or_None, sub_df, sorted_metric_series, unknown_count)
+        #   (facet_key_tuple, facet_label_or_None, n_rows, sorted_metric_series, unknown_count)
         # facet_key_tuple is always a tuple (() for the no-facet case, length
         # 1+ for faceted) so downstream code can split/recombine the facet
         # values without re-parsing labels. Compute ALL groups up to a hard
@@ -2840,7 +2841,13 @@ if uploaded_file:
                     unknown = count_unknown_rows(sub, mode="Yes", layout=layout)
                 else:
                     unknown = count_unknown_rows(sub, mode="No", target_col=target_col)
-                facet_results.append((facet_key, label, sub, metric, unknown))
+                # MEMORY: store the ROW COUNT, not the sub-DataFrame. Keeping
+                # the group slices alive in session_state duplicated the whole
+                # dataset (their union == df_active). Only len() was ever used.
+                facet_results.append((facet_key, label, len(sub), metric, unknown))
+            # Release the group slices immediately - only the small metric
+            # Series and counts survive into session_state.
+            del all_pairs
         else:
             # Single, no-facet - same shape as faceted so downstream code is uniform
             metric = _compute_metric_for_subset(df_active, mode, **metric_kwargs)
@@ -2848,7 +2855,7 @@ if uploaded_file:
                 unknown = count_unknown_rows(df_active, mode="Yes", layout=layout)
             else:
                 unknown = count_unknown_rows(df_active, mode="No", target_col=target_col)
-            facet_results = [((), None, df_active, metric, unknown)]
+            facet_results = [((), None, len(df_active), metric, unknown)]
 
         st.session_state["_facet_results"] = facet_results
         st.session_state["_facet_cache_key"] = _facet_cache_key
@@ -2967,7 +2974,7 @@ if uploaded_file:
             all_items.update(entry[3].index)
         if all_items:
             new_facet_results = []
-            for fkey, lbl, sub, metric, unknown in facet_results:
+            for fkey, lbl, n_rows, metric, unknown in facet_results:
                 missing = all_items - set(metric.index)
                 if missing:
                     zeros = pd.Series(
@@ -2976,9 +2983,9 @@ if uploaded_file:
                         dtype=metric.dtype if metric.dtype.kind in "iuf" else "float64",
                     )
                     filled = pd.concat([metric, zeros]).sort_values(ascending=False)
-                    new_facet_results.append((fkey, lbl, sub, filled, unknown))
+                    new_facet_results.append((fkey, lbl, n_rows, filled, unknown))
                 else:
-                    new_facet_results.append((fkey, lbl, sub, metric, unknown))
+                    new_facet_results.append((fkey, lbl, n_rows, metric, unknown))
             facet_results = new_facet_results
 
     # --- MAIN DISPLAY ---
@@ -3042,7 +3049,7 @@ if uploaded_file:
         # The SVG/PNG ZIP downloads in section 5 are independent of this
         # toggle - they render on click regardless.
         if show_charts:
-            for idx, (_facet_key, facet_label, sub_df, metric, unknown_count) in enumerate(facet_results[:MAX_FACET_DISPLAY]):
+            for idx, (_facet_key, facet_label, n_rows, metric, unknown_count) in enumerate(facet_results[:MAX_FACET_DISPLAY]):
                 # Slice to chart shape (respect exclusions, top-N, ranking direction)
                 chart_series = metric.drop(
                     [k for k in metric.index if k in exclude_set], errors="ignore"
@@ -3059,7 +3066,7 @@ if uploaded_file:
                     if idx > 0:
                         st.markdown("")  # extra spacing between charts
                     st.markdown(f"#### {facet_label}")
-                    st.caption(f"{len(sub_df):,} rows in this group")
+                    st.caption(f"{n_rows:,} rows in this group")
 
                 if not l_chart:
                     st.warning(
@@ -3078,7 +3085,7 @@ if uploaded_file:
                     (rank_mode == "Highest first"),
                     fmt_kind,
                 )
-                st.image(png_display, width="stretch")
+                st.image(png_display, use_container_width=True)
         else:
             # Charts hidden - give the user a hint about where to turn them on
             n_groups_displayed = min(len(facet_results), MAX_FACET_DISPLAY)
@@ -3158,7 +3165,7 @@ if uploaded_file:
                 st.session_state["_excel_value_label"] = value_label
             else:
                 # Single ranking - original side-by-side CSV layout
-                (_facet_key, facet_label, sub_df, metric_series, unknown_count) = facet_results[0]
+                (_facet_key, facet_label, _n_rows, metric_series, unknown_count) = facet_results[0]
                 final_series = metric_series.drop(
                     [k for k in metric_series.index if k in exclude_set], errors="ignore"
                 )
